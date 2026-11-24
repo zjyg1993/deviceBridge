@@ -37,8 +37,8 @@ expected = {'DeviceBridge.app', 'Applications', 'README.md'}
 if {p.name for p in volume.iterdir()} != expected:
     raise SystemExit('Unexpected disk image contents')
 PYREADME
-hdiutil makehybrid -hfs -hfs-volume-name "DeviceBridge ${version} Preview" -o "${release_dir}/image.hfs" "${volume_dir}"
-hdiutil convert "${release_dir}/image.hfs.dmg" -format UDZO -o "${image_path}"
-hdiutil verify "${image_path}"
+hdiutil create -srcfolder "${volume_dir}" -fs HFS+ -volname "DeviceBridge ${version} Preview" -format UDZO "${release_dir}/DeviceBridge.dmg"
+hdiutil verify "${release_dir}/DeviceBridge.dmg"
+mv "${release_dir}/DeviceBridge.dmg" "${image_path}"
 if [[ "${bundle_dir}" == "${project_dir}/build.noindex/DeviceBridge.app" ]]; then rm -rf "${bundle_dir}"; fi
 printf '%s\n' "Verified release: ${image_path}"

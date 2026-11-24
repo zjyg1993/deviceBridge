@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <DiskArbitration/DiskArbitration.h>
 #import <IOKit/hid/IOHIDManager.h>
 #import <IOKit/hidsystem/IOHIDLib.h>
 #import <IOKit/ps/IOPowerSources.h>
@@ -9,12 +10,13 @@
 #import "Policy.h"
 #import "Brand.h"
 #import "Display.h"
+#import "Disks.h"
 #import "NativeAudioSetup.h"
 #import "DisplayDDC.h"
 
 // Retained across the DeviceBridge rename for preferences, login items and permissions.
 static NSString *const BundleID=@"local.batterybridge.agent";
-static NSString *const Version=@"0.9.1-preview";
+static NSString *const Version=@"0.9.6-preview";
 static NSString *BBApplicationTitle(void){return [NSString stringWithFormat:@"DeviceBridge %@",Version];}
 static NSString *const InstallPath=@"/Applications/DeviceBridge.app";
 
@@ -534,8 +536,13 @@ static NSColor*BBGroupedColor(BOOL separator) {
         return [NSColor colorWithWhite:separator?(dark?0.28:0.88):(dark?0.17:0.96) alpha:1];
     }];
 }
+static void BBDrawDeviceSeparator(CGFloat width, CGFloat y) {
+    [BBGroupedColor(YES) setFill];
+    NSRectFill(NSMakeRect(72,y,MAX(0,width-88),0.5));
+}
 @interface BBFlippedView:NSView
 @property CGFloat groupHeight;
+@property CGFloat deviceRowHeight;
 @property BOOL settingsGroup;
 @end
 @implementation BBFlippedView
@@ -544,11 +551,15 @@ static NSColor*BBGroupedColor(BOOL separator) {
     NSRect rect=NSMakeRect(0,0,self.bounds.size.width,_groupHeight);
     [BBGroupedColor(NO) setFill];[[NSBezierPath bezierPathWithRoundedRect:rect xRadius:12 yRadius:12] fill];
     if(_settingsGroup){[BBGroupedColor(YES) setFill];NSRectFill(NSMakeRect(16,56,MAX(0,rect.size.width-32),0.5));}
+    for (CGFloat y = _deviceRowHeight; _deviceRowHeight > 0 && y < _groupHeight; y += _deviceRowHeight) {
+        BBDrawDeviceSeparator(rect.size.width, y-0.5);
+    }
 }
 @end
 @protocol BBMappingTarget <NSObject>
 - (void)setDeviceMapping:(NSMenuItem*)sender;
 - (void)refreshDevice:(NSMenuItem*)sender;
+- (void)deleteDevice:(NSMenuItem*)sender;
 - (void)permission:(id)sender;
 @end
 @interface BBDeviceRow:NSView
@@ -556,6 +567,7 @@ static NSColor*BBGroupedColor(BOOL separator) {
 @property(weak) id<BBMappingTarget> menuTarget;
 @property NSSwitch*mappingSwitch;
 @property NSButton*refreshButton;
+@property NSButton*deleteButton;
 @property BOOL showsSeparator;
 - (instancetype)initWithFrame:(NSRect)frame record:(NSDictionary*)r;
 @end
@@ -583,7 +595,14 @@ static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*colo
         NSTextField*charge=cardLabel(BBChargeStatus(r),NSMakeRect(w-306,27,100,16),[NSFont systemFontOfSize:10],connected&&fresh&&[r[@"charging"] boolValue]?NSColor.systemGreenColor:NSColor.secondaryLabelColor);charge.alignment=NSTextAlignmentRight;charge.accessibilityIdentifier=@"DeviceChargingStatus";[self addSubview:charge];
         NSTextField*mapLabel=cardLabel(@"电量映射到mac系统",NSMakeRect(w-190,60,134,15),[NSFont systemFontOfSize:10],NSColor.secondaryLabelColor);mapLabel.alignment=NSTextAlignmentCenter;[self addSubview:mapLabel];
         self.mappingSwitch=[[NSSwitch alloc]initWithFrame:NSMakeRect(w-144,29,44,24)];_mappingSwitch.controlSize=NSControlSizeSmall;_mappingSwitch.target=self;_mappingSwitch.action=@selector(mappingChanged:);_mappingSwitch.state=mappingEnabled(r[@"identity"]?:@"")?NSControlStateValueOn:NSControlStateValueOff;_mappingSwitch.enabled=supported;_mappingSwitch.accessibilityLabel=[NSString stringWithFormat:@"%@的电量映射到mac系统",r[@"name"]?:@"设备"];[self addSubview:_mappingSwitch];
-        self.refreshButton=[NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:needsPermission?@"lock.open":@"arrow.clockwise" accessibilityDescription:needsPermission?@"授权读取":@"刷新此设备"] target:self action:@selector(performDeviceAction:)];_refreshButton.frame=NSMakeRect(w-50,33,30,28);_refreshButton.bezelStyle=NSBezelStyleRounded;_refreshButton.enabled=connected&&(supported||needsPermission);_refreshButton.toolTip=needsPermission?@"授权读取此设备电量":@"刷新此设备电量";_refreshButton.accessibilityIdentifier=@"DeviceRefresh";[self addSubview:_refreshButton];
+        self.refreshButton=[NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:needsPermission?@"lock.open":@"arrow.clockwise" accessibilityDescription:needsPermission?@"授权读取":@"刷新此设备"] target:self action:@selector(performDeviceAction:)];_refreshButton.frame=NSMakeRect(w-88,33,30,28);_refreshButton.bezelStyle=NSBezelStyleRounded;_refreshButton.enabled=connected&&(supported||needsPermission);_refreshButton.toolTip=needsPermission?@"授权读取此设备电量":@"刷新此设备电量";_refreshButton.accessibilityIdentifier=@"DeviceRefresh";[self addSubview:_refreshButton];
+        self.deleteButton=[NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"trash" accessibilityDescription:@"删除设备"] target:self action:@selector(deleteDeviceRecord:)];
+        _deleteButton.frame=NSMakeRect(w-50,33,30,28);
+        _deleteButton.bezelStyle=NSBezelStyleRounded;
+        _deleteButton.enabled=!connected&&[r[@"identity"] length]>0;
+        _deleteButton.toolTip=@"删除设备";
+        _deleteButton.accessibilityIdentifier=@"DeviceDelete";
+        [self addSubview:_deleteButton];
         self.toolTip=r[@"status"];
     }return self;
 }
@@ -597,8 +616,25 @@ static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*colo
     NSMenuItem*item=[NSMenuItem new];item.representedObject=@{@"identity":_record[@"identity"]?:@"",@"enabled":@(sender.state==NSControlStateValueOn)};
     [_menuTarget setDeviceMapping:item];
 }
+- (void)deleteDeviceRecord:(id)sender {
+    if(!_deleteButton.enabled)return;
+    NSMenuItem*item=[NSMenuItem new];
+    item.representedObject=_record[@"identity"];
+    [_menuTarget deleteDevice:item];
+}
+- (NSMenu*)menuForEvent:(NSEvent*)event {
+    NSString*identity=_record[@"identity"];
+    id<BBMappingTarget> target=_menuTarget;
+    if(!_deleteButton.enabled||!target)return nil;
+
+    NSMenu*menu=[NSMenu new];
+    NSMenuItem*item=[menu addItemWithTitle:@"删除设备" action:@selector(deleteDevice:) keyEquivalent:@""];
+    item.target=target;
+    item.representedObject=identity;
+    return menu;
+}
 - (void)drawRect:(NSRect)dirty {
-    if(_showsSeparator){[BBGroupedColor(YES) setFill];NSRectFill(NSMakeRect(72,0,MAX(0,self.bounds.size.width-88),0.5));}
+    if(_showsSeparator) BBDrawDeviceSeparator(self.bounds.size.width,0);
 }
 @end
 
@@ -728,6 +764,14 @@ static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*colo
 @property BBFlippedView*devicesView;
 @property BBFlippedView*displayGroup;
 @property BBFlippedView*wirelessGroup;
+@property BBFlippedView *diskGroup;
+@property NSTextField *diskHeading;
+@property NSDictionary *diskSnapshot;
+@property NSTimeInterval lastDiskRefresh;
+@property BOOL diskScanRunning;
+@property BOOL diskRefreshPending;
+@property (assign) DASessionRef diskSession;
+@property NSTimer *diskChangeTimer;
 @property BBFlippedView*settingsGroup;
 @property NSTextField*displayHeading;
 @property NSTextField*wirelessHeading;
@@ -746,7 +790,14 @@ static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*colo
 @property BOOL terminationPending;
 @property BOOL terminationReady;
 @property BOOL terminationReplyPending;
+- (void)scheduleDiskRefresh;
 @end
+static void diskAppearedOrDisappeared(DADiskRef disk, void *context) {
+    [(__bridge BBApp *)context scheduleDiskRefresh];
+}
+static void diskVolumePathChanged(DADiskRef disk, CFArrayRef keys, void *context) {
+    [(__bridge BBApp *)context scheduleDiskRefresh];
+}
 static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButton*b=[NSButton buttonWithTitle:title target:target action:action];b.frame=frame;return b;}
 @implementation BBApp
 - (BOOL)installIfNeeded {
@@ -837,7 +888,7 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(reopenNotification:) name:@"local.batterybridge.showSettings" object:BundleID];
     [self createStatusItem];
     self.engine=[BBEngine new];self.thread=[[NSThread alloc]initWithTarget:_engine selector:@selector(run) object:nil];self.thread.name=@"DeviceBridge HID";[_thread start];
-    if(!BBTestingUI){self.displays=[BBDisplayController new];[_displays start];}
+    if(!BBTestingUI){self.displays=[BBDisplayController new];[_displays start];[self startWatchingDisks];}
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(wake:) name:NSWorkspaceDidWakeNotification object:nil];
     if(!BBTestingUI&&[BBPreferences() boolForKey:@"AutoStartEnabled"]&&SMAppService.mainAppService.status==SMAppServiceStatusNotRegistered){NSError*e=nil;[SMAppService.mainAppService registerAndReturnError:&e];}
     self.timer=[NSTimer scheduledTimerWithTimeInterval:2 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
@@ -880,7 +931,22 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     [NSApp activateIgnoringOtherApps:YES];[a runModal];
 }
 - (void)deleteDevice:(NSMenuItem*)sender {
-    for(NSDictionary*r in [_engine status])if([r[@"identity"] isEqual:sender.representedObject]&&![r[@"connected"] boolValue]){[_engine forgetIdentity:sender.representedObject];break;}
+    if (!_window || _window.attachedSheet) return;
+    NSString *identity = sender.representedObject;
+    for (NSDictionary *record in [_engine status]) {
+        if (![record[@"identity"] isEqual:identity] || [record[@"connected"] boolValue]) continue;
+        NSAlert *alert = [NSAlert new];
+        alert.alertStyle = NSAlertStyleWarning;
+        alert.messageText = [NSString stringWithFormat:@"删除「%@」？", record[@"name"] ?: @"设备"];
+        alert.informativeText = @"此设备的记录和电量映射设置将从 DeviceBridge 中移除。";
+        [alert addButtonWithTitle:@"取消"].keyEquivalent = @"\r";
+        NSButton *deleteButton = [alert addButtonWithTitle:@"删除"];
+        deleteButton.hasDestructiveAction = YES;
+        [alert beginSheetModalForWindow:_window completionHandler:^(NSModalResponse response) {
+            if (response == NSAlertSecondButtonReturn) [self.engine forgetIdentity:identity];
+        }];
+        return;
+    }
 }
 - (void)pickInterval:(NSPopUpButton*)sender {[self changeInterval:sender.selectedItem];}
 - (void)changeInterval:(NSMenuItem*)sender {[BBPreferences() setObject:@(BBInterval(sender.representedObject)) forKey:@"ReportInterval"];[_engine kick];[self refresh];}
@@ -903,6 +969,53 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
 
 - (void)wake:(NSNotification*)n {[_engine kick];}
 - (BOOL)applicationShouldHandleReopen:(NSApplication*)sender hasVisibleWindows:(BOOL)visible {[self showWindow];return YES;}
+- (void)startWatchingDisks {
+    _diskSession = DASessionCreate(kCFAllocatorDefault);
+    if (!_diskSession) return;
+    void *context = (__bridge void *)self;
+    DARegisterDiskAppearedCallback(_diskSession, kDADiskDescriptionMatchMediaWhole, diskAppearedOrDisappeared, context);
+    DARegisterDiskDisappearedCallback(_diskSession, kDADiskDescriptionMatchMediaWhole, diskAppearedOrDisappeared, context);
+    NSArray *volumePath = @[(__bridge NSString *)kDADiskDescriptionVolumePathKey];
+    DARegisterDiskDescriptionChangedCallback(_diskSession, NULL, (__bridge CFArrayRef)volumePath, diskVolumePathChanged, context);
+    DASessionSetDispatchQueue(_diskSession, dispatch_get_main_queue());
+}
+- (void)scheduleDiskRefresh {
+    // A single disk can generate multiple partition and volume events.
+    [_diskChangeTimer invalidate];
+    _diskChangeTimer = [NSTimer timerWithTimeInterval:0.5 target:self selector:@selector(refreshAfterDiskChange:) userInfo:nil repeats:NO];
+    [NSRunLoop.mainRunLoop addTimer:_diskChangeTimer forMode:NSRunLoopCommonModes];
+}
+- (void)refreshAfterDiskChange:(NSTimer *)timer {
+    _diskChangeTimer = nil;
+    [self refreshDisks:YES];
+}
+- (void)refreshDisks:(BOOL)force {
+    if (BBTestingUI) return;
+    if (_diskScanRunning) {
+        if (force) _diskRefreshPending = YES;
+        return;
+    }
+    if (!force) {
+        if (!_window.isVisible) return;
+        NSTimeInterval interval = BBInterval([BBPreferences() objectForKey:@"ReportInterval"]);
+        if (_diskSnapshot && NSProcessInfo.processInfo.systemUptime - _lastDiskRefresh < interval) return;
+    }
+    _diskScanRunning = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *snapshot = DBReadDisks();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.diskScanRunning = NO;
+            self.lastDiskRefresh = NSProcessInfo.processInfo.systemUptime;
+            self.diskSnapshot = snapshot;
+            if (self.diskRefreshPending) {
+                self.diskRefreshPending = NO;
+                [self refreshDisks:YES];
+            }
+            [self refresh];
+        });
+    });
+}
+
 - (void)buildWindow {
     if(_window)return;
     self.window=[[NSWindow alloc]initWithContentRect:NSMakeRect(0,0,720,700) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];
@@ -915,14 +1028,17 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     self.authorizeButton=button(@"授权读取…",self,@selector(permission:),NSMakeRect(584,64,112,28));_authorizeButton.hidden=YES;_authorizeButton.autoresizingMask=NSViewMinXMargin;[_devicesView addSubview:_authorizeButton];
     self.displayHeading=cardLabel(@"显示器",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
     self.wirelessHeading=cardLabel(@"2.4G 设备",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
+    self.diskHeading=cardLabel(@"硬盘",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
     self.generalHeading=cardLabel(@"通用",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
-    for(NSTextField *heading in @[_displayHeading,_wirelessHeading,_generalHeading])[_devicesView addSubview:heading];
+    for(NSTextField *heading in @[_displayHeading,_wirelessHeading,_diskHeading,_generalHeading])[_devicesView addSubview:heading];
     self.displayGroup=[[BBFlippedView alloc]initWithFrame:NSZeroRect];self.wirelessGroup=[[BBFlippedView alloc]initWithFrame:NSZeroRect];
+    self.diskGroup=[[BBFlippedView alloc]initWithFrame:NSZeroRect];
     [_devicesView addSubview:_displayGroup];[_devicesView addSubview:_wirelessGroup];
+    [_devicesView addSubview:_diskGroup];
     self.settingsGroup=[[BBFlippedView alloc]initWithFrame:NSMakeRect(24,0,672,116)];_settingsGroup.groupHeight=116;_settingsGroup.settingsGroup=YES;[_devicesView addSubview:_settingsGroup];
     self.heading=cardLabel(@"自动更新",NSMakeRect(16,18,200,20),[NSFont systemFontOfSize:13],NSColor.labelColor);[_settingsGroup addSubview:_heading];
     self.intervalPicker=[[NSPopUpButton alloc]initWithFrame:NSMakeRect(520,15,136,26) pullsDown:NO];_intervalPicker.target=self;_intervalPicker.action=@selector(pickInterval:);_intervalPicker.autoresizingMask=NSViewMinXMargin;_intervalPicker.accessibilityLabel=@"自动更新周期";
-    for(NSNumber *n in @[@1800,@3600,@7200,@10800]){[_intervalPicker addItemWithTitle:[@"每" stringByAppendingString:BBIntervalLabel(n.doubleValue)]];_intervalPicker.lastItem.representedObject=n;}[_settingsGroup addSubview:_intervalPicker];
+    for(NSNumber *n in @[@300,@1800,@3600,@7200,@10800]){[_intervalPicker addItemWithTitle:[@"每" stringByAppendingString:BBIntervalLabel(n.doubleValue)]];_intervalPicker.lastItem.representedObject=n;}[_settingsGroup addSubview:_intervalPicker];
     [_settingsGroup addSubview:cardLabel(@"登录时启动",NSMakeRect(16,75,220,20),[NSFont systemFontOfSize:13],NSColor.labelColor)];
     self.autoStartSwitch=[[NSSwitch alloc]initWithFrame:NSMakeRect(612,73,44,24)];_autoStartSwitch.target=self;_autoStartSwitch.action=@selector(toggleAutoStart:);_autoStartSwitch.controlSize=NSControlSizeSmall;_autoStartSwitch.accessibilityLabel=@"登录时启动";_autoStartSwitch.autoresizingMask=NSViewMinXMargin;[_settingsGroup addSubview:_autoStartSwitch];
     if(!BBTestingUI){[_window setFrameAutosaveName:@"DeviceListWindow"];[_window setFrameUsingName:@"DeviceListWindow"];}
@@ -935,11 +1051,12 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
 - (void)showWindow {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [self buildWindow];
-    [self refresh];[_window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];
+    [_window makeKeyAndOrderFront:nil];[self refresh];[NSApp activateIgnoringOtherApps:YES];
 }
 - (void)refresh {
     NSTimeInterval interval=BBInterval([BBPreferences() objectForKey:@"ReportInterval"]);
     _statusItem.button.toolTip=[NSString stringWithFormat:@"%@ · 设备状态与显示器控制 · 每%@上报",BBApplicationTitle(),BBIntervalLabel(interval)];if(!_window)return;
+    [self refreshDisks:NO];
     NSArray*rows=[[_engine status] arrayByAddingObjectsFromArray:_displays.snapshot?:@[]];_heading.stringValue=@"自动更新";
     for(NSMenuItem*i in _intervalPicker.itemArray)if([i.representedObject doubleValue]==interval){[_intervalPicker selectItem:i];break;}
     _autoStartSwitch.state=[BBPreferences() boolForKey:@"AutoStartEnabled"]?NSControlStateValueOn:NSControlStateValueOff;
@@ -951,7 +1068,7 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     for(NSView *view in _displayGroup.subviews){
         if([view isKindOfClass:BBDisplayRow.class]&&((BBDisplayRow*)view).isTrackingBrightness)return;
     }
-    NSString*signature=[NSString stringWithFormat:@"%@:%ld",rows,(long)(NSDate.date.timeIntervalSince1970/120)];if([signature isEqual:_devicesSignature])return;_devicesSignature=signature;
+    NSString*signature=[NSString stringWithFormat:@"%@:%@:%ld",rows,_diskSnapshot,(long)(NSDate.date.timeIntervalSince1970/120)];if([signature isEqual:_devicesSignature])return;_devicesSignature=signature;
     NSPoint origin=_devicesScroll.contentView.bounds.origin;
     _devicesScroll.autohidesScrollers=NO;[_devicesScroll tile];
     CGFloat documentWidth=MAX(1,_devicesScroll.contentSize.width),width=MAX(1,documentWidth-48),y=100;
@@ -971,6 +1088,56 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
         }
         [group setNeedsDisplay:YES];y+=groupHeight+28;
     }
+    _diskHeading.frame=NSMakeRect(26,y,MAX(1,width-4),20);y+=32;
+    NSArray *diskRows = _diskSnapshot[@"rows"];
+    CGFloat diskRowHeight = 120, diskGroupHeight = diskRows.count ? diskRows.count * diskRowHeight : 64;
+    _diskGroup.frame = NSMakeRect(24,y,width,diskGroupHeight);
+    _diskGroup.groupHeight = diskGroupHeight;
+    _diskGroup.deviceRowHeight = diskRows.count ? diskRowHeight : 0;
+    for (NSView *view in _diskGroup.subviews.copy) [view removeFromSuperview];
+    NSFont *metricFont = [NSFont systemFontOfSize:12];
+    if (!diskRows.count) {
+        NSString *status = _diskSnapshot[@"status"] ?: (BBTestingUI ? @"未发现硬盘" : @"正在读取硬盘…");
+        [_diskGroup addSubview:cardLabel(status,NSMakeRect(72,22,width-88,20),metricFont,NSColor.secondaryLabelColor)];
+    }
+    NSArray *metricNames = @[@"总读取", @"总写入", @"已用/总计", @"温度", @"健康度", @"通电次数", @"通电小时", @"卷标"];
+    [diskRows enumerateObjectsUsingBlock:^(NSDictionary *record, NSUInteger index, BOOL *stop) {
+        CGFloat top = index * diskRowHeight;
+        NSString *symbol = [record[@"external"] boolValue] ? @"externaldrive" : @"internaldrive";
+        CGFloat iconSize = 40;
+        CGFloat iconY = top + (diskRowHeight - iconSize) / 2;
+        NSImageView *icon = [[NSImageView alloc] initWithFrame:NSMakeRect(16,iconY,iconSize,iconSize)];
+        icon.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
+        icon.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:28 weight:NSFontWeightRegular];
+        icon.contentTintColor = NSColor.secondaryLabelColor;
+        [_diskGroup addSubview:icon];
+        CGFloat titleX = 72, titleY = top + 12, availableWidth = width - titleX - 16;
+        NSTextField *title = cardLabel(record[@"title"],NSMakeRect(titleX,titleY,availableWidth,20),[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
+        title.toolTip = record[@"title"];
+        [_diskGroup addSubview:title];
+        if ([record[@"smartUnavailable"] boolValue]) {
+            NSTextField *warning = cardLabel(@"此磁盘主控不支持读取SMART信息",NSZeroRect,metricFont,NSColor.secondaryLabelColor);
+            CGFloat gap = 12, warningWidth = MIN(ceil(warning.fittingSize.width)+4, availableWidth/2);
+            CGFloat titleWidth = MIN(ceil(title.fittingSize.width)+4, availableWidth-warningWidth-gap);
+            title.frame = NSMakeRect(titleX,titleY,titleWidth,20);
+            warning.frame = NSMakeRect(titleX+titleWidth+gap,titleY,warningWidth,20);
+            warning.toolTip = warning.stringValue;
+            [_diskGroup addSubview:warning];
+        }
+        CGFloat columnWidth = availableWidth / 3;
+        NSString *volumeNames = record[@"volumeNames"];
+        NSArray *values = [record[@"metrics"] arrayByAddingObject:volumeNames.length ? volumeNames : @"—"];
+        for (NSUInteger i = 0; i < metricNames.count; i++) {
+            NSString *value = [NSString stringWithFormat:@"%@  %@", metricNames[i], values[i]];
+            CGFloat metricWidth = i == metricNames.count-1 ? 2 * columnWidth : columnWidth-8;
+            NSRect frame = NSMakeRect(titleX+(i%3)*columnWidth,top+43+(i/3)*23,metricWidth,20);
+            NSTextField *metric = cardLabel(value,frame,metricFont,NSColor.labelColor);
+            metric.toolTip = value;
+            [_diskGroup addSubview:metric];
+        }
+    }];
+    [_diskGroup setNeedsDisplay:YES];
+    y += diskGroupHeight + 28;
     _generalHeading.frame=NSMakeRect(26,y,MAX(1,width-4),20);y+=32;
     _settingsGroup.frame=NSMakeRect(24,y,width,116);y+=140;
     _devicesView.frame=NSMakeRect(0,0,documentWidth,MAX(y,_devicesScroll.contentSize.height));
@@ -984,7 +1151,7 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     if(!BBTestingUI&&IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)){[_engine kick];[self refresh];return;}
     [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"]];
 }
-- (void)rescan:(id)sender {[_engine kick];[_displays refreshControls];}
+- (void)rescan:(id)sender {[_engine kick];[_displays refreshControls];[self refreshDisks:YES];}
 - (void)login:(id)sender {if(!BBTestingUI)[SMAppService openSystemSettingsLoginItems];}
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
     if(BBTestingUI||!_displays||_terminationReady)return NSTerminateNow;
@@ -1016,7 +1183,15 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
         else finish(YES);
     }];
 }
-- (void)applicationWillTerminate:(NSNotification*)n {[_nativeAudio stop];[_displays stop];_engine.stopping=YES;[_timer invalidate];if(_lockFD>=0)close(_lockFD);}
+- (void)applicationWillTerminate:(NSNotification*)n {
+    if (_diskSession) {
+        DASessionSetDispatchQueue(_diskSession, NULL);
+        CFRelease(_diskSession);
+        _diskSession = NULL;
+    }
+    [_diskChangeTimer invalidate];
+    [_nativeAudio stop];[_displays stop];_engine.stopping=YES;[_timer invalidate];if(_lockFD>=0)close(_lockFD);
+}
 @end
 
 int main(int argc,const char*argv[]){@autoreleasepool{

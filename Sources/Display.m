@@ -388,8 +388,13 @@ static void BBDisplayReconfigured(CGDirectDisplayID display,CGDisplayChangeSumma
 }
 - (void)beginMediaKeyOnboarding {
     if(!_running||_readOnly||_mediaKeyOnboardingPending)return;
-    NSString *build=[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]?:@"development";
-    if([[_preferences objectForKey:@"MediaKeyPermissionRequestedBuild"] isEqual:build])return;
+    NSString *onboardingKey=@"MediaKeyPermissionOnboardingCompleted";
+    if([[_preferences objectForKey:onboardingKey] boolValue])return;
+    // Older releases stored the last build that checked permission.
+    if([_preferences objectForKey:@"MediaKeyPermissionRequestedBuild"]){
+        [_preferences setObject:@YES forKey:onboardingKey];
+        return;
+    }
     _mediaKeyOnboardingPending=YES;NSUInteger generation=_generation;
     // Preflight off the AppKit thread; wait for the real PostEvent result before
     // deciding whether a first-launch request is needed. The OS owns consent.
@@ -398,7 +403,7 @@ static void BBDisplayReconfigured(CGDirectDisplayID display,CGDisplayChangeSumma
             self.mediaKeyOnboardingPending=NO;
             if(!self.running||self.readOnly||self.generation!=generation)return;
             self.deviceControlStatus=status;self.permissionCheckComplete=YES;
-            [self.preferences setObject:build forKey:@"MediaKeyPermissionRequestedBuild"];
+            [self.preferences setObject:@YES forKey:onboardingKey];
             if(self.mediaKeysAuthorized)return;
             dispatch_async(self.permissionQueue,^{
                 if(!self.running)return;
