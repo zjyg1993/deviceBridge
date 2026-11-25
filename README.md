@@ -32,20 +32,20 @@ DeviceBridge 是轻量的 macOS 原生菜单栏应用，提供无线外设电量
 
 ### 使用截图
 
-**主界面：统一查看设备状态、设置电量映射，并调节显示器亮度与音量。**
+**主界面：查看 2.4G 键鼠电量与硬盘 SMART 信息，并通过 DDC/CI 调节外接显示器亮度和音量。**
 
-<p align="center"><img src="./docs/assets/main-window.jpg" width="760" alt="DeviceBridge 0.8.2 主界面，显示无线键鼠电量与显示器亮度、音量控制"></p>
+<p align="center"><img src="./docs/assets/main-window.jpg" width="760" alt="DeviceBridge 0.9.6 Preview 主界面，包含显示器、2.4G 设备、硬盘和通用设置"></p>
+
+主界面使用当前版本的 AppKit 界面渲染，设备与读数为演示数据。
 
 **状态栏菜单：仅保留“显示主界面”和“退出程序”。以下为旧版菜单截图。**
 
 <p align="center"><img src="./docs/assets/status-menu.jpg" width="760" alt="DeviceBridge 状态栏设备菜单展开，包含键鼠电量及显示器亮度、音量滑块"></p>
 
-截图来自 0.8.2 的历史 AppKit 界面，设备和数值为文档演示数据；当前版本的设备列表和调节滑块仅在主界面显示。历史截图不表示已接入 macOS 原生控制中心。
-
 <details>
 <summary>查看宣传海报</summary>
 
-<p align="center"><img src="./docs/assets/devicebridge-poster.png" width="540" alt="DeviceBridge 宣传海报：键鼠电量展示、状态栏即看即调及 DDC 显示器控制"></p>
+<p align="center"><img src="./docs/assets/devicebridge-poster.png" width="540" alt="DeviceBridge 0.9.6 Preview 海报，介绍 2.4G 键鼠电量、DDC/CI 显示器调节、硬盘 SMART 和菜单栏入口"></p>
 
 </details>
 
