@@ -173,7 +173,7 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     BOOL hasMappingLabel=NO;
     for(NSView*v in card.subviews){
         ensure(![v.accessibilityIdentifier isEqual:@"DeviceActions"],"device row has no more-actions button");
-        if([v isKindOfClass:NSTextField.class]&&[[(NSTextField*)v stringValue] isEqual:@"电量映射到mac系统"])hasMappingLabel=YES;
+        if([v isKindOfClass:NSTextField.class]&&[[(NSTextField*)v stringValue] isEqual:@"映射"])hasMappingLabel=YES;
     }
     ensure(hasMappingLabel,"mapping label uses requested wording");
     app.engine.forcePoll=NO;
@@ -217,26 +217,42 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     app.engine.snapshot=fixtures;
     NSImage*brand=BBStatusIcon();ensure(brand.isTemplate&&brand.size.width==20,"brand menu bar icon is a monochrome system template");
     [app buildWindow];
-    app.diskSnapshot = @{@"rows": @[
+    NSDictionary *diskFixture = @{@"rows": @[
         @{@"title": @"APPLE SSD · disk0", @"volumeNames": @"Macintosh HD",
           @"metrics": @[@"1.37 TB / 1.21 TB", @"86.06 GB / 500.28 GB", @"25 °C", @"100%", @"155 次", @"13 小时"]},
-        @{@"title": @"USB Drive · disk2", @"volumeNames": @"", @"smartUnavailable": @YES,
+        @{@"title": @"USB Drive · disk2", @"identifier": @"disk2", @"ejectIdentifier": @123, @"volumeNames": @"", @"smartUnavailable": @YES,
           @"metrics": @[@"— / —", @"—", @"—", @"—", @"—", @"—"]}
     ]};
+    app.diskSnapshot = diskFixture;
     [app refresh];
     NSMutableArray<NSImage *> *diskIcons = [NSMutableArray new];
     NSMutableArray<NSString *> *diskLabels = [NSMutableArray new];
+    NSMutableArray<NSButton *> *ejectButtons = [NSMutableArray new];
+    NSTextField *readMetric = nil;
     for (NSView *view in app.diskGroup.subviews) {
         if ([view isKindOfClass:NSImageView.class] && ((NSImageView *)view).image)
             [diskIcons addObject:((NSImageView *)view).image];
-        if ([view isKindOfClass:NSTextField.class])
-            [diskLabels addObject:((NSTextField *)view).stringValue];
+        if ([view isKindOfClass:NSTextField.class]) {
+            NSTextField *field = (NSTextField *)view;
+            [diskLabels addObject:field.stringValue];
+            if ([field.stringValue hasPrefix:@"总读取/总合并  1.37"]) readMetric = field;
+        }
+        if ([view isKindOfClass:NSButton.class]) [ejectButtons addObject:(NSButton *)view];
     }
     ensure(diskIcons.count == 2 && [diskIcons[0] isEqual:diskIcons[1]], "all physical disks use the same icon");
     ensure([diskLabels containsObject:@"APPLE SSD · disk0 (Macintosh HD)"] &&
            [diskLabels containsObject:@"USB Drive · disk2"], "only disks with volume names get a parenthesized suffix");
     ensure([diskLabels containsObject:@"总读取/总合并  1.37 TB / 1.21 TB"] &&
            [diskLabels containsObject:@"总读取/总合并  — / —"], "read and write totals share one field");
+    NSAttributedString *styledMetric = readMetric.attributedStringValue;
+    ensure([[styledMetric attribute:NSForegroundColorAttributeName atIndex:0 effectiveRange:NULL] isEqual:NSColor.secondaryLabelColor] &&
+           [[styledMetric attribute:NSForegroundColorAttributeName atIndex:styledMetric.length-1 effectiveRange:NULL] isEqual:NSColor.labelColor],
+           "disk metric labels and values use distinct text colors");
+    NSButton *eject = ejectButtons.firstObject;
+    ensure(ejectButtons.count == 1 && [eject.title isEqual:@"弹出"] &&
+           [eject.cell.representedObject[@"identifier"] isEqual:@"disk2"] &&
+           NSMaxX(eject.frame) == NSWidth(app.diskGroup.bounds)-16 && NSMidY(eject.frame) == 180,
+           "only the ejectable disk gets a button, centered at the right edge of its row");
     app.diskSnapshot = nil;
     BOOL hasListTitle=NO;for(NSView*v in app.devicesView.subviews)if([v isKindOfClass:NSTextField.class]&&[[(NSTextField*)v stringValue] isEqual:@"设备列表"])hasListTitle=YES;
     ensure(hasListTitle,"main window title uses device list wording");
@@ -308,6 +324,33 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     NSMutableDictionary *confirmedReading=[displayFixture mutableCopy];confirmedReading[@"brightness"]=@{@"percent":@85};
     [app.displays setValue:@[confirmedReading] forKey:@"snapshot"];[app refresh];
     ensure(((BBDisplayRow*)app.displayGroup.subviews.firstObject).brightnessSlider.intValue==85,"confirming the final value does not move the thumb backwards");
+    BBDisplayRow *editableRow = (BBDisplayRow *)app.displayGroup.subviews.firstObject;
+    for (NSNumber *volume in @[@NO, @YES]) {
+        NSTextField *field = [editableRow valueForKey:volume.boolValue ? @"volumeValueLabel" : @"brightnessValueLabel"];
+        NSSlider *slider = volume.boolValue ? editableRow.volumeSlider : editableRow.brightnessSlider;
+        ensure(field.isEditable && [app.window makeFirstResponder:field], "available percent field accepts keyboard focus");
+        NSTextView *editor = (NSTextView *)field.currentEditor;
+        [editor insertText:@"37" replacementRange:NSMakeRange(0, editor.string.length)];
+        app.devicesSignature = nil;
+        [app refresh];
+        ensure(app.displayGroup.subviews.firstObject == editableRow && [editor.string isEqual:@"37"], "refresh preserves the in-progress percentage");
+        [editor insertNewline:nil];
+        NSDictionary *request = permissionDisplays.requests.lastObject;
+        ensure(slider.intValue == 37 && [field.stringValue isEqual:@"37%"] && [request[@"percent"] isEqual:@37] &&
+               [request[@"code"] isEqual:volume.boolValue ? @0x62 : @0x10], "Return applies the exact percentage to the matching monitor control");
+        NSUInteger count = permissionDisplays.requests.count;
+        ensure([app.window makeFirstResponder:field], "percent field can be edited again");
+        editor = (NSTextView *)field.currentEditor;
+        [editor insertText:@"101" replacementRange:NSMakeRange(0, editor.string.length)];
+        [editor insertNewline:nil];
+        ensure(permissionDisplays.requests.count == count && [field.stringValue isEqual:@"37%"], "out-of-range input restores the last value without writing");
+        ensure([app.window makeFirstResponder:field], "percent field can accept a new edit after invalid input");
+        editor = (NSTextView *)field.currentEditor;
+        [editor insertText:@"42" replacementRange:NSMakeRange(0, editor.string.length)];
+        [editor doCommandBySelector:@selector(cancelOperation:)];
+        ensure(permissionDisplays.requests.count == count && [field.stringValue isEqual:@"37%"] && !editableRow.isEditingPercent,
+               "Escape cancels the edit without changing the control");
+    }
     ensure(app.displayGroup.groupHeight==96&&app.wirelessGroup.groupHeight==fixtures.count*96,"each category has its own grouped rows");
     ensure(NSMaxY(app.displayGroup.frame)<NSMinY(app.wirelessHeading.frame)&&NSMaxY(app.wirelessGroup.frame)<NSMinY(app.generalHeading.frame),"displays precede wireless devices and general settings");
     ensure(app.settingsGroup.superview==app.devicesView&&app.authorizeButton.superview==app.devicesView,"settings and header belong to the same scroll document");
@@ -318,7 +361,11 @@ int main(int argc,const char*argv[]){@autoreleasepool{
             [app.window setContentSize:size.sizeValue];app.devicesSignature=nil;[app refresh];
             for(NSView*row in [app.displayGroup.subviews arrayByAddingObjectsFromArray:app.wirelessGroup.subviews]){
                 ensure(row.frame.size.height==96,"display and wireless rows share the same height");
-                for(NSView*control in row.subviews)ensure(NSMinX(control.frame)>=0&&NSMaxX(control.frame)<=row.bounds.size.width,"mixed row controls fit at narrow and wide widths");
+                for(NSView*control in row.subviews){
+                    ensure(NSMinX(control.frame)>=0&&NSMaxX(control.frame)<=row.bounds.size.width,"mixed row controls fit at narrow and wide widths");
+                    if ([control isKindOfClass:NSImageView.class] && NSWidth(control.frame) == 40)
+                        ensure(NSMidY(control.frame) == NSMidY(row.bounds), "device icon is centered vertically in its row");
+                }
             }
         }
     }
@@ -374,7 +421,7 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     ensure(![BBPowerDetails(@"test.yjx",@"YJX",@"Mouse",contradictory)[@"Is Charged"] boolValue],"macOS never receives charging and charged simultaneously");
     if(argc>1){
         BBPermissionDisplayController *permissionDisplays=[BBPermissionDisplayController new];app.displays=permissionDisplays;[app.displays setValue:@[displayFixture] forKey:@"snapshot"];
-        app.engine.snapshot=fixtures;[app.window setContentSize:NSMakeSize(660,600)];app.devicesSignature=nil;[app refresh];
+        app.diskSnapshot=diskFixture;app.engine.snapshot=fixtures;[app.window setContentSize:NSMakeSize(660,600)];app.devicesSignature=nil;[app refresh];
         if(argc>2)app.window.appearance=[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
         NSView*root=app.devicesView;
         NSBitmapImageRep*rep=[[NSBitmapImageRep alloc]initWithBitmapDataPlanes:NULL pixelsWide:(NSInteger)(root.bounds.size.width*2) pixelsHigh:(NSInteger)(root.bounds.size.height*2) bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:0 bitsPerPixel:0];rep.size=root.bounds.size;

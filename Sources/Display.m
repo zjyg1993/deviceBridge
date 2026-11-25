@@ -723,15 +723,18 @@ static NSTextField *BBDisplayLabel(NSString*text,NSRect frame,CGFloat size,NSCol
 }
 @end
 
-@interface BBDisplayRow ()
+@interface BBDisplayRow () <NSTextFieldDelegate>
 @property NSTextField *brightnessValueLabel;
+@property NSTextField *volumeValueLabel;
+@property BOOL hasUncommittedPercent;
 @end
 @implementation BBDisplayRow
 @synthesize controller=_controller;
 - (instancetype)initWithFrame:(NSRect)frame record:(NSDictionary*)record {
     if((self=[super initWithFrame:frame])){
         _record=record;CGFloat w=frame.size.width;CGFloat sliderWidth=MIN(220,MAX(110,w*.23)),sliderX=w-240-sliderWidth;BOOL connected=![record[@"connected"] isEqual:@NO];
-        NSImageView*icon=[[NSImageView alloc]initWithFrame:NSMakeRect(16,28,40,40)];icon.image=[NSImage imageWithSystemSymbolName:@"display" accessibilityDescription:@"显示器"];icon.symbolConfiguration=[NSImageSymbolConfiguration configurationWithPointSize:28 weight:NSFontWeightRegular];icon.contentTintColor=connected?NSColor.secondaryLabelColor:NSColor.tertiaryLabelColor;[self addSubview:icon];
+        CGFloat iconSize=40;
+        NSImageView*icon=[[NSImageView alloc]initWithFrame:NSMakeRect(16,NSMidY(self.bounds)-iconSize/2,iconSize,iconSize)];icon.imageAlignment=NSImageAlignCenter;icon.autoresizingMask=NSViewMinYMargin|NSViewMaxYMargin;icon.image=[NSImage imageWithSystemSymbolName:@"display" accessibilityDescription:@"显示器"];icon.symbolConfiguration=[NSImageSymbolConfiguration configurationWithPointSize:28 weight:NSFontWeightRegular];icon.contentTintColor=connected?NSColor.secondaryLabelColor:NSColor.tertiaryLabelColor;[self addSubview:icon];
         NSTextField*name=BBDisplayLabel(record[@"name"]?:@"外接显示器",NSMakeRect(72,56,MAX(1,sliderX-100),20),13,NSColor.labelColor);name.font=[NSFont systemFontOfSize:13 weight:NSFontWeightMedium];name.toolTip=name.stringValue;[self addSubview:name];
         NSString *connection=!connected?@"未连接":((record[@"brightness"]||record[@"volume"])?@"已连接":@"显示器在线 · 等待读取");
         NSString*time=@"尚未读取";if([record[@"updated"] doubleValue]>0)time=[NSString stringWithFormat:@"%@ %@",connected?@"更新于":@"上次读取",[NSDateFormatter localizedStringFromDate:[NSDate dateWithTimeIntervalSince1970:[record[@"updated"] doubleValue]] dateStyle:NSDateFormatterNoStyle timeStyle:NSDateFormatterShortStyle]];
@@ -747,8 +750,18 @@ static NSTextField *BBDisplayLabel(NSString*text,NSRect frame,CGFloat size,NSCol
             slider.minValue=0;slider.maxValue=100;slider.doubleValue=[v[@"percent"] doubleValue];slider.target=self;slider.action=i?@selector(volumeChanged:):@selector(brightnessChanged:);
             slider.controlSize=NSControlSizeSmall;slider.enabled=BBDisplayControlAvailable(record,i?0x62:0x10);slider.continuous=!i;slider.accessibilityLabel=[NSString stringWithFormat:@"%@%@",name.stringValue,i?@"音量":@"亮度"];slider.toolTip=slider.enabled?slider.accessibilityLabel:(record[[f stringByAppendingString:@"Error"]]?:([record[@"scanning"] boolValue]?@"正在探测显示器，请稍候":@"此控制不可用 · 请启用 DDC/CI 后刷新"));[self addSubview:slider];
             if(i)_volumeSlider=slider;else _brightnessSlider=slider;
-            NSTextField*value=BBDisplayLabel(slider.enabled?[NSString stringWithFormat:@"%.0f%%",[v[@"percent"] doubleValue]]:@"—",NSMakeRect(w-238,y,42,20),11,NSColor.labelColor);value.alignment=NSTextAlignmentRight;value.font=[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular];[self addSubview:value];
-            if(!i)_brightnessValueLabel=value;
+            NSTextField *value = [[NSTextField alloc] initWithFrame:NSMakeRect(w-236,y-1,42,22)];
+            value.stringValue = slider.enabled ? [NSString stringWithFormat:@"%.0f%%",slider.doubleValue] : @"—";
+            value.alignment = NSTextAlignmentRight;
+            value.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular];
+            value.controlSize = NSControlSizeSmall;
+            value.cell.usesSingleLineMode = YES;
+            value.enabled = value.editable = value.selectable = slider.enabled;
+            value.accessibilityLabel = [slider.accessibilityLabel stringByAppendingString:@"百分比"];
+            value.toolTip = slider.enabled ? @"输入 0–100，按回车确认" : slider.toolTip;
+            value.delegate = self;
+            [self addSubview:value];
+            if (i) _volumeValueLabel = value; else _brightnessValueLabel = value;
         }
         BOOL brightnessAvailable=[record[@"brightnessBridgeAvailable"] boolValue];
         BOOL brightnessEnabled=brightnessAvailable&&[record[@"brightnessBridgeEnabled"]?:record[@"mappingEnabled"] boolValue];
@@ -775,6 +788,46 @@ static NSTextField *BBDisplayLabel(NSString*text,NSRect frame,CGFloat size,NSCol
 - (BOOL)isTrackingBrightness {
     return [_brightnessSlider isKindOfClass:BBBrightnessSlider.class]&&((BBBrightnessSlider*)_brightnessSlider).tracking;
 }
+- (BOOL)isEditingPercent {
+    return _hasUncommittedPercent;
+}
+- (void)controlTextDidChange:(NSNotification *)notification {
+    _hasUncommittedPercent = YES;
+}
+- (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)selector {
+    if (selector != @selector(cancelOperation:)) return NO;
+    _hasUncommittedPercent = NO;
+    [control abortEditing];
+    NSSlider *slider = control == _brightnessValueLabel ? _brightnessSlider : _volumeSlider;
+    control.stringValue = [NSString stringWithFormat:@"%.0f%%",slider.doubleValue];
+    return YES;
+}
+- (void)controlTextDidEndEditing:(NSNotification *)notification {
+    BOOL changed = _hasUncommittedPercent;
+    _hasUncommittedPercent = NO;
+    NSTextField *field = notification.object;
+    NSSlider *slider = field == _brightnessValueLabel ? _brightnessSlider : _volumeSlider;
+    NSString *previous = [NSString stringWithFormat:@"%.0f%%",slider.doubleValue];
+    if (!changed || [notification.userInfo[@"NSTextMovement"] integerValue] == NSCancelTextMovement ||
+        [field.stringValue isEqualToString:previous]) {
+        field.stringValue = previous;
+        return;
+    }
+
+    NSCharacterSet *spaces = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+    NSString *input = [field.stringValue stringByTrimmingCharactersInSet:spaces];
+    if ([input hasSuffix:@"%"] || [input hasSuffix:@"％"])
+        input = [[input substringToIndex:input.length-1] stringByTrimmingCharactersInSet:spaces];
+    NSInteger percent = input.integerValue;
+    if (!input.length || [input rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet]].location != NSNotFound || percent > 100) {
+        field.stringValue = previous;
+        NSBeep();
+        return;
+    }
+    slider.doubleValue = percent;
+    field.stringValue = [NSString stringWithFormat:@"%ld%%",(long)percent];
+    [slider sendAction:slider.action to:slider.target];
+}
 - (void)setController:(BBDisplayController*)controller {
     _controller=controller;
     NSNumber *pending=[controller pendingBrightnessForIdentity:_record[@"identity"]];
@@ -792,9 +845,13 @@ static NSTextField *BBDisplayLabel(NSString*text,NSRect frame,CGFloat size,NSCol
 - (void)refreshDisplay:(id)sender {[_controller refreshControls];}
 - (void)brightnessChanged:(NSSlider*)sender {
     if(!sender.enabled)return;
-    _brightnessValueLabel.stringValue=[NSString stringWithFormat:@"%.0f%%",sender.doubleValue];
+    if(!_brightnessValueLabel.currentEditor)_brightnessValueLabel.stringValue=[NSString stringWithFormat:@"%.0f%%",sender.doubleValue];
     [_controller setPercent:sender.doubleValue code:0x10 identity:_record[@"identity"]];
 }
-- (void)volumeChanged:(NSSlider*)sender {[_controller setPercent:sender.doubleValue code:0x62 identity:_record[@"identity"]];}
+- (void)volumeChanged:(NSSlider*)sender {
+    if(!sender.enabled)return;
+    if(!_volumeValueLabel.currentEditor)_volumeValueLabel.stringValue=[NSString stringWithFormat:@"%.0f%%",sender.doubleValue];
+    [_controller setPercent:sender.doubleValue code:0x62 identity:_record[@"identity"]];
+}
 - (void)drawRect:(NSRect)dirty {if(_showsSeparator){[[NSColor separatorColor] setFill];NSRectFill(NSMakeRect(72,0,MAX(0,self.bounds.size.width-88),.5));}}
 @end

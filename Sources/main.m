@@ -16,7 +16,7 @@
 
 // Retained across the DeviceBridge rename for preferences, login items and permissions.
 static NSString *const BundleID=@"local.batterybridge.agent";
-static NSString *const Version=@"0.9.7-preview";
+static NSString *const Version=@"0.9.8-preview";
 static NSString *BBApplicationTitle(void){return [NSString stringWithFormat:@"DeviceBridge %@",Version];}
 static NSString *const InstallPath=@"/Applications/DeviceBridge.app";
 
@@ -580,7 +580,8 @@ static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*colo
         CGFloat w=frame.size.width;
         BOOL supported=[r[@"selectable"] boolValue]&&[r[@"identity"] length]>0;
         NSString*symbol=[r[@"category"] isEqual:@"Keyboard"]?@"keyboard":([r[@"category"] isEqual:@"Mouse"]?@"computermouse":@"cable.connector");
-        NSImageView*icon=[[NSImageView alloc]initWithFrame:NSMakeRect(16,28,40,40)];icon.image=[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:r[@"category"]];icon.symbolConfiguration=[NSImageSymbolConfiguration configurationWithPointSize:28 weight:NSFontWeightRegular];icon.contentTintColor=connected?NSColor.secondaryLabelColor:NSColor.tertiaryLabelColor;[self addSubview:icon];
+        CGFloat iconSize=40;
+        NSImageView*icon=[[NSImageView alloc]initWithFrame:NSMakeRect(16,NSMidY(self.bounds)-iconSize/2,iconSize,iconSize)];icon.imageAlignment=NSImageAlignCenter;icon.autoresizingMask=NSViewMinYMargin|NSViewMaxYMargin;icon.image=[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:r[@"category"]];icon.symbolConfiguration=[NSImageSymbolConfiguration configurationWithPointSize:28 weight:NSFontWeightRegular];icon.contentTintColor=connected?NSColor.secondaryLabelColor:NSColor.tertiaryLabelColor;[self addSubview:icon];
         NSTextField*name=cardLabel(r[@"name"]?:@"USB 设备",NSMakeRect(72,56,w-368,20),[NSFont systemFontOfSize:13 weight:NSFontWeightMedium],NSColor.labelColor);name.toolTip=r[@"name"];[self addSubview:name];
         NSString*connection=!connected?@"未连接":(needsPermission?@"需要输入监控授权":(fresh?@"已连接":@"接收器在线 · 等待电量"));
         NSColor*stateColor=connected&&needsPermission?NSColor.systemOrangeColor:NSColor.secondaryLabelColor;
@@ -593,7 +594,7 @@ static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*colo
         NSString*percent=(connected&&fresh&&r[@"percent"])?[NSString stringWithFormat:@"%@%%",r[@"percent"]]:@"—";
         NSTextField*battery=cardLabel(percent,NSMakeRect(w-286,48,80,26),[NSFont monospacedDigitSystemFontOfSize:20 weight:NSFontWeightRegular],connected?NSColor.labelColor:NSColor.secondaryLabelColor);battery.alignment=NSTextAlignmentRight;[self addSubview:battery];
         NSTextField*charge=cardLabel(BBChargeStatus(r),NSMakeRect(w-306,27,100,16),[NSFont systemFontOfSize:10],connected&&fresh&&[r[@"charging"] boolValue]?NSColor.systemGreenColor:NSColor.secondaryLabelColor);charge.alignment=NSTextAlignmentRight;charge.accessibilityIdentifier=@"DeviceChargingStatus";[self addSubview:charge];
-        NSTextField*mapLabel=cardLabel(@"电量映射到mac系统",NSMakeRect(w-190,60,134,15),[NSFont systemFontOfSize:10],NSColor.secondaryLabelColor);mapLabel.alignment=NSTextAlignmentCenter;[self addSubview:mapLabel];
+        NSTextField*mapLabel=cardLabel(@"映射",NSMakeRect(w-154,60,64,15),[NSFont systemFontOfSize:10],NSColor.secondaryLabelColor);mapLabel.alignment=NSTextAlignmentCenter;[self addSubview:mapLabel];
         self.mappingSwitch=[[NSSwitch alloc]initWithFrame:NSMakeRect(w-144,29,44,24)];_mappingSwitch.controlSize=NSControlSizeSmall;_mappingSwitch.target=self;_mappingSwitch.action=@selector(mappingChanged:);_mappingSwitch.state=mappingEnabled(r[@"identity"]?:@"")?NSControlStateValueOn:NSControlStateValueOff;_mappingSwitch.enabled=supported;_mappingSwitch.accessibilityLabel=[NSString stringWithFormat:@"%@的电量映射到mac系统",r[@"name"]?:@"设备"];[self addSubview:_mappingSwitch];
         self.refreshButton=[NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:needsPermission?@"lock.open":@"arrow.clockwise" accessibilityDescription:needsPermission?@"授权读取":@"刷新此设备"] target:self action:@selector(performDeviceAction:)];_refreshButton.frame=NSMakeRect(w-88,33,30,28);_refreshButton.bezelStyle=NSBezelStyleRounded;_refreshButton.enabled=connected&&(supported||needsPermission);_refreshButton.toolTip=needsPermission?@"授权读取此设备电量":@"刷新此设备电量";_refreshButton.accessibilityIdentifier=@"DeviceRefresh";[self addSubview:_refreshButton];
         self.deleteButton=[NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"trash" accessibilityDescription:@"删除设备"] target:self action:@selector(deleteDeviceRecord:)];
@@ -770,6 +771,7 @@ static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*colo
 @property NSTimeInterval lastDiskRefresh;
 @property BOOL diskScanRunning;
 @property BOOL diskRefreshPending;
+@property NSMutableSet<NSNumber *> *ejectingDisks;
 @property (assign) DASessionRef diskSession;
 @property NSTimer *diskChangeTimer;
 @property BBFlippedView*settingsGroup;
@@ -797,6 +799,14 @@ static void diskAppearedOrDisappeared(DADiskRef disk, void *context) {
 }
 static void diskVolumePathChanged(DADiskRef disk, CFArrayRef keys, void *context) {
     [(__bridge BBApp *)context scheduleDiskRefresh];
+}
+static void diskEjected(DADiskRef disk, DADissenterRef dissenter, void *context) {
+    void (^complete)(DAReturn) = CFBridgingRelease(context);
+    complete(dissenter ? DADissenterGetStatus(dissenter) : kDAReturnSuccess);
+}
+static void diskUnmountedForEject(DADiskRef disk, DADissenterRef dissenter, void *context) {
+    if (dissenter) diskEjected(disk, dissenter, context);
+    else DADiskEject(disk, kDADiskEjectOptionDefault, diskEjected, context);
 }
 static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButton*b=[NSButton buttonWithTitle:title target:target action:action];b.frame=frame;return b;}
 @implementation BBApp
@@ -1001,12 +1011,16 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
         if (_diskSnapshot && NSProcessInfo.processInfo.systemUptime - _lastDiskRefresh < interval) return;
     }
     _diskScanRunning = YES;
+    NSDictionary *snapshotBeforeScan = _diskSnapshot;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSDictionary *snapshot = DBReadDisks();
         dispatch_async(dispatch_get_main_queue(), ^{
             self.diskScanRunning = NO;
-            self.lastDiskRefresh = NSProcessInfo.processInfo.systemUptime;
-            self.diskSnapshot = snapshot;
+            // Keep a completed eject from being undone by a scan already in flight.
+            if (self.diskSnapshot == snapshotBeforeScan) {
+                self.lastDiskRefresh = NSProcessInfo.processInfo.systemUptime;
+                self.diskSnapshot = snapshot;
+            }
             if (self.diskRefreshPending) {
                 self.diskRefreshPending = NO;
                 [self refreshDisks:YES];
@@ -1014,6 +1028,48 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
             [self refresh];
         });
     });
+}
+
+- (void)ejectDisk:(NSButton *)sender {
+    NSDictionary *record = sender.cell.representedObject;
+    NSNumber *identity = record[@"ejectIdentifier"];
+    if (!_diskSession || !identity || [_ejectingDisks containsObject:identity]) return;
+
+    NSString *device = [@"/dev/" stringByAppendingString:record[@"identifier"]];
+    DADiskRef disk = DADiskCreateFromBSDName(kCFAllocatorDefault, _diskSession, device.fileSystemRepresentation);
+    if (![DBDiskEjectIdentifier(disk) isEqual:identity]) {
+        if (disk) CFRelease(disk);
+        [self refreshDisks:YES];
+        return;
+    }
+
+    if (!_ejectingDisks) _ejectingDisks = [NSMutableSet new];
+    [_ejectingDisks addObject:identity];
+    sender.enabled = NO;
+    void (^complete)(DAReturn) = ^(DAReturn result) {
+        [self.ejectingDisks removeObject:identity];
+        if (result == kDAReturnSuccess) {
+            NSMutableArray *remaining = [NSMutableArray new];
+            for (NSDictionary *row in self.diskSnapshot[@"rows"])
+                if (![row[@"ejectIdentifier"] isEqual:identity]) [remaining addObject:row];
+            self.diskSnapshot = @{@"rows": remaining, @"status": @"未发现硬盘"};
+        } else {
+            sender.enabled = YES;
+            if (self.window.isVisible) {
+                NSAlert *alert = [NSAlert new];
+                alert.messageText = @"无法弹出硬盘";
+                alert.informativeText = result == kDAReturnBusy
+                    ? [NSString stringWithFormat:@"%@ 正在使用中。请关闭使用此硬盘的文件和应用后重试。", record[@"title"]]
+                    : [NSString stringWithFormat:@"macOS 无法弹出 %@。", record[@"title"]];
+                [alert beginSheetModalForWindow:self.window completionHandler:nil];
+            }
+        }
+        self.devicesSignature = nil;
+        [self refreshDisks:YES];
+        [self refresh];
+    };
+    DADiskUnmount(disk, kDADiskUnmountOptionWhole, diskUnmountedForEject, (__bridge_retained void *)[complete copy]);
+    CFRelease(disk);
 }
 
 - (void)buildWindow {
@@ -1066,7 +1122,10 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     _authorizeButton.hidden=!denied;_authorizeButton.title=@"授权读取…";_authorizeButton.action=@selector(permission:);
     _authorizeButton.toolTip=@"授权读取设备电量";
     for(NSView *view in _displayGroup.subviews){
-        if([view isKindOfClass:BBDisplayRow.class]&&((BBDisplayRow*)view).isTrackingBrightness)return;
+        if ([view isKindOfClass:BBDisplayRow.class]) {
+            BBDisplayRow *row = (BBDisplayRow *)view;
+            if (row.isTrackingBrightness || row.isEditingPercent) return;
+        }
     }
     NSString*signature=[NSString stringWithFormat:@"%@:%@:%ld",rows,_diskSnapshot,(long)(NSDate.date.timeIntervalSince1970/120)];if([signature isEqual:_devicesSignature])return;_devicesSignature=signature;
     NSPoint origin=_devicesScroll.contentView.bounds.origin;
@@ -1095,13 +1154,16 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     _diskGroup.groupHeight = diskGroupHeight;
     _diskGroup.deviceRowHeight = diskRows.count ? diskRowHeight : 0;
     for (NSView *view in _diskGroup.subviews.copy) [view removeFromSuperview];
-    NSFont *metricFont = [NSFont systemFontOfSize:12];
+    NSFont *metricFont = [NSFont systemFontOfSize:11];
     if (!diskRows.count) {
         NSString *status = _diskSnapshot[@"status"] ?: (BBTestingUI ? @"未发现硬盘" : @"正在读取硬盘…");
         [_diskGroup addSubview:cardLabel(status,NSMakeRect(72,22,width-88,20),metricFont,NSColor.secondaryLabelColor)];
     }
     NSArray *metricNames = @[@"总读取/总合并", @"已用/总计", @"温度", @"健康度", @"通电次数", @"通电小时"];
     NSImage *diskIcon = [NSImage imageWithSystemSymbolName:@"internaldrive" accessibilityDescription:nil];
+    BOOL hasEjectButton = NO;
+    for (NSDictionary *record in diskRows) if (record[@"ejectIdentifier"]) { hasEjectButton = YES; break; }
+    CGFloat ejectWidth = 58;
     [diskRows enumerateObjectsUsingBlock:^(NSDictionary *record, NSUInteger index, BOOL *stop) {
         CGFloat top = index * diskRowHeight;
         CGFloat iconSize = 40;
@@ -1112,10 +1174,11 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
         icon.contentTintColor = NSColor.secondaryLabelColor;
         [_diskGroup addSubview:icon];
         CGFloat titleX = 72, titleY = top + 12, availableWidth = width - titleX - 16;
+        if (hasEjectButton) availableWidth -= ejectWidth + 12;
         NSString *diskTitle = record[@"title"];
         NSString *volumeNames = record[@"volumeNames"];
         if (volumeNames.length) diskTitle = [diskTitle stringByAppendingFormat:@" (%@)", volumeNames];
-        NSTextField *title = cardLabel(diskTitle,NSMakeRect(titleX,titleY,availableWidth,20),[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
+        NSTextField *title = cardLabel(diskTitle,NSMakeRect(titleX,titleY,availableWidth,20),[NSFont systemFontOfSize:13 weight:NSFontWeightMedium],NSColor.labelColor);
         title.toolTip = diskTitle;
         [_diskGroup addSubview:title];
         if ([record[@"smartUnavailable"] boolValue]) {
@@ -1130,11 +1193,24 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
         CGFloat columnWidth = availableWidth / 2;
         NSArray *values = record[@"metrics"];
         for (NSUInteger i = 0; i < metricNames.count; i++) {
-            NSString *value = [NSString stringWithFormat:@"%@  %@", metricNames[i], values[i]];
+            NSString *label = [metricNames[i] stringByAppendingString:@"  "];
+            NSString *value = values[i];
             NSRect frame = NSMakeRect(titleX+(i%2)*columnWidth,top+43+(i/2)*23,columnWidth-8,20);
-            NSTextField *metric = cardLabel(value,frame,metricFont,NSColor.labelColor);
-            metric.toolTip = value;
+            NSMutableAttributedString *text = [[NSMutableAttributedString alloc] initWithString:label attributes:@{NSFontAttributeName: metricFont, NSForegroundColorAttributeName: NSColor.secondaryLabelColor}];
+            [text appendAttributedString:[[NSAttributedString alloc] initWithString:value attributes:@{NSFontAttributeName: metricFont, NSForegroundColorAttributeName: NSColor.labelColor}]];
+            NSTextField *metric = cardLabel(@"",frame,metricFont,NSColor.labelColor);
+            metric.attributedStringValue = text;
+            metric.toolTip = text.string;
             [_diskGroup addSubview:metric];
+        }
+        if (record[@"ejectIdentifier"]) {
+            NSButton *eject = button(@"弹出", self, @selector(ejectDisk:), NSMakeRect(width-16-ejectWidth,top+(diskRowHeight-28)/2,ejectWidth,28));
+            eject.bezelStyle = NSBezelStyleRounded;
+            eject.cell.representedObject = record;
+            eject.enabled = ![_ejectingDisks containsObject:record[@"ejectIdentifier"]];
+            eject.accessibilityIdentifier = @"DiskEject";
+            eject.accessibilityLabel = [@"弹出 " stringByAppendingString:diskTitle];
+            [_diskGroup addSubview:eject];
         }
     }];
     [_diskGroup setNeedsDisplay:YES];

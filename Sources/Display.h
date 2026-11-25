@@ -35,5 +35,6 @@
 @property NSButton *refreshButton;
 @property BOOL showsSeparator;
 @property(nonatomic,readonly,getter=isTrackingBrightness) BOOL trackingBrightness;
+@property(nonatomic,readonly,getter=isEditingPercent) BOOL editingPercent;
 - (instancetype)initWithFrame:(NSRect)frame record:(NSDictionary*)record;
 @end

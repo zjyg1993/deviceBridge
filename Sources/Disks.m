@@ -1,4 +1,5 @@
 #import "Disks.h"
+#import <IOKit/IOKitLib.h>
 #import <signal.h>
 #import <unistd.h>
 
@@ -53,6 +54,23 @@ static NSString *diskBytes(double bytes) {
 
 static NSNumber *number(id value) {
     return [value isKindOfClass:NSNumber.class] ? value : nil;
+}
+
+NSNumber *DBDiskEjectIdentifier(DADiskRef disk) {
+    if (!disk) return nil;
+    NSDictionary *description = CFBridgingRelease(DADiskCopyDescription(disk));
+    if (![description[(__bridge NSString *)kDADiskDescriptionMediaWholeKey] boolValue]) return nil;
+    // External SSDs can be safely ejected even when their media is fixed in the enclosure.
+    BOOL external = [description[(__bridge NSString *)kDADiskDescriptionDeviceInternalKey] isEqual:@NO];
+    BOOL ejectable = [description[(__bridge NSString *)kDADiskDescriptionMediaEjectableKey] boolValue];
+    if (!external && !ejectable) return nil;
+
+    io_service_t media = DADiskCopyIOMedia(disk);
+    if (!media) return nil;
+    uint64_t identity = 0;
+    kern_return_t result = IORegistryEntryGetRegistryEntryID(media, &identity);
+    IOObjectRelease(media);
+    return result == KERN_SUCCESS ? @(identity) : nil;
 }
 
 static double volumeUsed(NSDictionary *info) {
@@ -174,6 +192,7 @@ NSDictionary *DBReadDisks(void) {
     NSArray *containers = diskutil(@[@"apfs", @"list", @"-plist"])[@"Containers"];
     NSString *smartctl = smartctlPath();
     NSMutableArray *rows = [NSMutableArray new];
+    DASessionRef session = DASessionCreate(kCFAllocatorDefault);
     for (NSDictionary *disk in disks) {
         NSString *identifier = disk[@"DeviceIdentifier"];
         if (!identifier.length) continue;
@@ -193,10 +212,18 @@ NSDictionary *DBReadDisks(void) {
             [support[@"available"] isEqual:@NO] || [support[@"enabled"] isEqual:@NO];
         NSMutableOrderedSet *volumeNames = [NSMutableOrderedSet orderedSet];
         NSString *usage = diskUsage(disk, info, containers, volumeNames);
-        [rows addObject:@{@"title": title,
+        NSMutableDictionary *row = [@{@"title": title, @"identifier": identifier,
                           @"metrics": smartMetrics(smart, info, usage),
                           @"volumeNames": [volumeNames.array componentsJoinedByString:@"、"],
-                          @"smartUnavailable": @(smartUnavailable)}];
+                          @"smartUnavailable": @(smartUnavailable)} mutableCopy];
+        if (session) {
+            NSString *device = [@"/dev/" stringByAppendingString:identifier];
+            DADiskRef media = DADiskCreateFromBSDName(kCFAllocatorDefault, session, device.fileSystemRepresentation);
+            row[@"ejectIdentifier"] = DBDiskEjectIdentifier(media);
+            if (media) CFRelease(media);
+        }
+        [rows addObject:row];
     }
+    if (session) CFRelease(session);
     return @{@"rows": rows, @"status": @"未发现硬盘"};
 }
