@@ -160,7 +160,8 @@ static NSArray *smartMetrics(NSDictionary *smart, NSDictionary *info, NSString *
     NSNumber *temperature = number(smart[@"temperature"][@"current"]) ?: number(nvme[@"temperature"]);
     NSNumber *cycles = number(smart[@"power_cycle_count"]) ?: number(nvme[@"power_cycles"]);
     NSNumber *hours = number(smart[@"power_on_time"][@"hours"]) ?: number(nvme[@"power_on_hours"]);
-    return @[diskBytes(readBytes), diskBytes(writtenBytes), usage, smartCount(temperature, @"°C"),
+    NSString *readWrite = [NSString stringWithFormat:@"%@ / %@", diskBytes(readBytes), diskBytes(writtenBytes)];
+    return @[readWrite, usage, smartCount(temperature, @"°C"),
              health, smartCount(cycles, @"次"), smartCount(hours, @"小时")];
 }
 
@@ -190,10 +191,9 @@ NSDictionary *DBReadDisks(void) {
         NSDictionary *support = smart[@"smart_support"];
         BOOL smartUnavailable = !smart || ([smart[@"smartctl"][@"exit_status"] intValue] & 3) ||
             [support[@"available"] isEqual:@NO] || [support[@"enabled"] isEqual:@NO];
-        BOOL external = info[@"Internal"] && ![info[@"Internal"] boolValue];
         NSMutableOrderedSet *volumeNames = [NSMutableOrderedSet orderedSet];
         NSString *usage = diskUsage(disk, info, containers, volumeNames);
-        [rows addObject:@{@"title": title, @"external": @(external),
+        [rows addObject:@{@"title": title,
                           @"metrics": smartMetrics(smart, info, usage),
                           @"volumeNames": [volumeNames.array componentsJoinedByString:@"、"],
                           @"smartUnavailable": @(smartUnavailable)}];

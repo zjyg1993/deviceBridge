@@ -16,7 +16,7 @@
 
 // Retained across the DeviceBridge rename for preferences, login items and permissions.
 static NSString *const BundleID=@"local.batterybridge.agent";
-static NSString *const Version=@"0.9.6-preview";
+static NSString *const Version=@"0.9.7-preview";
 static NSString *BBApplicationTitle(void){return [NSString stringWithFormat:@"DeviceBridge %@",Version];}
 static NSString *const InstallPath=@"/Applications/DeviceBridge.app";
 
@@ -1100,20 +1100,23 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
         NSString *status = _diskSnapshot[@"status"] ?: (BBTestingUI ? @"未发现硬盘" : @"正在读取硬盘…");
         [_diskGroup addSubview:cardLabel(status,NSMakeRect(72,22,width-88,20),metricFont,NSColor.secondaryLabelColor)];
     }
-    NSArray *metricNames = @[@"总读取", @"总写入", @"已用/总计", @"温度", @"健康度", @"通电次数", @"通电小时", @"卷标"];
+    NSArray *metricNames = @[@"总读取/总合并", @"已用/总计", @"温度", @"健康度", @"通电次数", @"通电小时"];
+    NSImage *diskIcon = [NSImage imageWithSystemSymbolName:@"internaldrive" accessibilityDescription:nil];
     [diskRows enumerateObjectsUsingBlock:^(NSDictionary *record, NSUInteger index, BOOL *stop) {
         CGFloat top = index * diskRowHeight;
-        NSString *symbol = [record[@"external"] boolValue] ? @"externaldrive" : @"internaldrive";
         CGFloat iconSize = 40;
         CGFloat iconY = top + (diskRowHeight - iconSize) / 2;
         NSImageView *icon = [[NSImageView alloc] initWithFrame:NSMakeRect(16,iconY,iconSize,iconSize)];
-        icon.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
+        icon.image = diskIcon;
         icon.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:28 weight:NSFontWeightRegular];
         icon.contentTintColor = NSColor.secondaryLabelColor;
         [_diskGroup addSubview:icon];
         CGFloat titleX = 72, titleY = top + 12, availableWidth = width - titleX - 16;
-        NSTextField *title = cardLabel(record[@"title"],NSMakeRect(titleX,titleY,availableWidth,20),[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
-        title.toolTip = record[@"title"];
+        NSString *diskTitle = record[@"title"];
+        NSString *volumeNames = record[@"volumeNames"];
+        if (volumeNames.length) diskTitle = [diskTitle stringByAppendingFormat:@" (%@)", volumeNames];
+        NSTextField *title = cardLabel(diskTitle,NSMakeRect(titleX,titleY,availableWidth,20),[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
+        title.toolTip = diskTitle;
         [_diskGroup addSubview:title];
         if ([record[@"smartUnavailable"] boolValue]) {
             NSTextField *warning = cardLabel(@"此磁盘主控不支持读取SMART信息",NSZeroRect,metricFont,NSColor.secondaryLabelColor);
@@ -1124,13 +1127,11 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
             warning.toolTip = warning.stringValue;
             [_diskGroup addSubview:warning];
         }
-        CGFloat columnWidth = availableWidth / 3;
-        NSString *volumeNames = record[@"volumeNames"];
-        NSArray *values = [record[@"metrics"] arrayByAddingObject:volumeNames.length ? volumeNames : @"—"];
+        CGFloat columnWidth = availableWidth / 2;
+        NSArray *values = record[@"metrics"];
         for (NSUInteger i = 0; i < metricNames.count; i++) {
             NSString *value = [NSString stringWithFormat:@"%@  %@", metricNames[i], values[i]];
-            CGFloat metricWidth = i == metricNames.count-1 ? 2 * columnWidth : columnWidth-8;
-            NSRect frame = NSMakeRect(titleX+(i%3)*columnWidth,top+43+(i/3)*23,metricWidth,20);
+            NSRect frame = NSMakeRect(titleX+(i%2)*columnWidth,top+43+(i/2)*23,columnWidth-8,20);
             NSTextField *metric = cardLabel(value,frame,metricFont,NSColor.labelColor);
             metric.toolTip = value;
             [_diskGroup addSubview:metric];

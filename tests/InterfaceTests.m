@@ -217,6 +217,27 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     app.engine.snapshot=fixtures;
     NSImage*brand=BBStatusIcon();ensure(brand.isTemplate&&brand.size.width==20,"brand menu bar icon is a monochrome system template");
     [app buildWindow];
+    app.diskSnapshot = @{@"rows": @[
+        @{@"title": @"APPLE SSD · disk0", @"volumeNames": @"Macintosh HD",
+          @"metrics": @[@"1.37 TB / 1.21 TB", @"86.06 GB / 500.28 GB", @"25 °C", @"100%", @"155 次", @"13 小时"]},
+        @{@"title": @"USB Drive · disk2", @"volumeNames": @"", @"smartUnavailable": @YES,
+          @"metrics": @[@"— / —", @"—", @"—", @"—", @"—", @"—"]}
+    ]};
+    [app refresh];
+    NSMutableArray<NSImage *> *diskIcons = [NSMutableArray new];
+    NSMutableArray<NSString *> *diskLabels = [NSMutableArray new];
+    for (NSView *view in app.diskGroup.subviews) {
+        if ([view isKindOfClass:NSImageView.class] && ((NSImageView *)view).image)
+            [diskIcons addObject:((NSImageView *)view).image];
+        if ([view isKindOfClass:NSTextField.class])
+            [diskLabels addObject:((NSTextField *)view).stringValue];
+    }
+    ensure(diskIcons.count == 2 && [diskIcons[0] isEqual:diskIcons[1]], "all physical disks use the same icon");
+    ensure([diskLabels containsObject:@"APPLE SSD · disk0 (Macintosh HD)"] &&
+           [diskLabels containsObject:@"USB Drive · disk2"], "only disks with volume names get a parenthesized suffix");
+    ensure([diskLabels containsObject:@"总读取/总合并  1.37 TB / 1.21 TB"] &&
+           [diskLabels containsObject:@"总读取/总合并  — / —"], "read and write totals share one field");
+    app.diskSnapshot = nil;
     BOOL hasListTitle=NO;for(NSView*v in app.devicesView.subviews)if([v isKindOfClass:NSTextField.class]&&[[(NSTextField*)v stringValue] isEqual:@"设备列表"])hasListTitle=YES;
     ensure(hasListTitle,"main window title uses device list wording");
     for(NSView *view in app.settingsGroup.subviews)if([view isKindOfClass:NSTextField.class])ensure(![[(NSTextField*)view stringValue] isEqual:@"登录 Mac 后自动运行 DeviceBridge"],"login switch has no redundant description text");
