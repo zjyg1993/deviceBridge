@@ -1,5 +1,4 @@
 #import <Cocoa/Cocoa.h>
-#import <DiskArbitration/DiskArbitration.h>
 #import <IOKit/hid/IOHIDManager.h>
 #import <IOKit/hidsystem/IOHIDLib.h>
 #import <IOKit/ps/IOPowerSources.h>
@@ -10,13 +9,12 @@
 #import "Policy.h"
 #import "Brand.h"
 #import "Display.h"
-#import "Disks.h"
 #import "NativeAudioSetup.h"
 #import "DisplayDDC.h"
 
 // Retained across the DeviceBridge rename for preferences, login items and permissions.
 static NSString *const BundleID=@"local.batterybridge.agent";
-static NSString *const Version=@"0.9.8-preview";
+static NSString *const Version=@"0.9.9-preview";
 static NSString *BBApplicationTitle(void){return [NSString stringWithFormat:@"DeviceBridge %@",Version];}
 static NSString *const InstallPath=@"/Applications/DeviceBridge.app";
 
@@ -118,6 +116,7 @@ static NSString *physicalID(NSDictionary*p){return [NSString stringWithFormat:@"
 @property NSMutableArray<NSDictionary*> *frames;
 @property NSSet<NSNumber*> *allowedInputReports;
 @property IOReturn lastError;
+@property uint8_t logitechSoftwareID;
 @property(copy) void(^inputHandler)(NSDictionary*);
 - (instancetype)initWithDevice:(IOHIDDeviceRef)d;
 - (BOOL)open;
@@ -220,7 +219,10 @@ static BOOL BBASUSKeyboardInterfaceMatches(NSDictionary*p,NSString*physical){
 }
 
 static NSData *hpp(BBChannel*c,uint8_t slot,uint8_t feature,uint8_t function,NSData*params){
-    uint8_t fn=(uint8_t)((function<<4)|0x0d);
+    // Root replies do not echo the requested feature ID. Distinguish consecutive requests by their software IDs.
+    uint8_t softwareID=c.logitechSoftwareID;
+    c.logitechSoftwareID=softwareID?softwareID%15+1:arc4random_uniform(15)+1;
+    uint8_t fn=(uint8_t)((function<<4)|c.logitechSoftwareID);
     uint8_t bytes[6]={slot,feature,fn,0,0,0};
     if(params.length>3)return nil;if(params.length)memcpy(bytes+3,params.bytes,params.length);
     NSDictionary*f=[c exchange:0x10 payload:[NSData dataWithBytes:bytes length:6] matching:^BOOL(NSDictionary*f){
@@ -229,8 +231,24 @@ static NSData *hpp(BBChannel*c,uint8_t slot,uint8_t feature,uint8_t function,NSD
     }];
     if(!f)return nil;return BBLogitechEnvelope(f[@"data"],[f[@"id"] intValue])[@"payload"];
 }
-static uint8_t featureIndex(BBChannel*c,uint8_t slot,uint16_t feature){
-    uint8_t bytes[3]={feature>>8,feature&255,0};NSData*d=hpp(c,slot,0,0,[NSData dataWithBytes:bytes length:3]);return d.length?((uint8_t*)d.bytes)[0]:0;
+static NSNumber *featureIndex(BBChannel*c,uint8_t slot,uint16_t feature){
+    uint8_t bytes[3]={feature>>8,feature&255,0};
+    NSData*d=hpp(c,slot,0,0,[NSData dataWithBytes:bytes length:3]);
+    return d.length?@(((const uint8_t*)d.bytes)[0]):nil;
+}
+static NSDictionary *BBLogitechBattery(BBChannel*c,uint8_t slot){
+    uint16_t feature=0x1004;
+    NSNumber*index=featureIndex(c,slot,feature);
+    if(!index&&c.lastError==kIOReturnTimeout)index=featureIndex(c,slot,feature);
+    if(!index)return nil;
+    // Only an explicit zero means the mouse does not support the unified battery feature.
+    if(index.unsignedCharValue==0){
+        feature=0x1000;
+        index=featureIndex(c,slot,feature);
+    }
+    if(index.unsignedCharValue==0)return nil;
+    NSData*payload=hpp(c,slot,index.unsignedCharValue,feature==0x1004?1:0,[NSData data]);
+    return BBLogitechDecodeBattery(payload,feature);
 }
 static NSDictionary *logitechName(BBChannel*c,uint8_t slot,uint8_t index){
     if(!index)return nil;
@@ -488,9 +506,8 @@ static BOOL mappingEnabled(NSString *identity){return [[BBPreferences() dictiona
             BOOL found=NO;
             for(uint8_t slot=1;slot<=6&&!self.stopping;slot++){
                 if(!due&&![targets containsObject:logicalID(physical,slot)])continue;
-                uint16_t feature=0x1004;uint8_t index=featureIndex(c,slot,feature);if(!index){feature=0x1000;index=featureIndex(c,slot,feature);}if(!index)continue;
-                NSData*payload=hpp(c,slot,index,feature==0x1004?1:0,[NSData data]);NSDictionary*reading=BBLogitechDecodeBattery(payload,feature);if(!reading)continue;
-                NSDictionary*info=logitechName(c,slot,featureIndex(c,slot,0x0005));if(![info[@"name"] length]||[info[@"category"] isEqual:@"Unknown"]){_errors[physical]=@"已读到电量，设备名称或类型尚未确认";continue;}
+                NSDictionary*reading=BBLogitechBattery(c,slot);if(!reading)continue;
+                NSDictionary*info=logitechName(c,slot,featureIndex(c,slot,0x0005).unsignedCharValue);if(![info[@"name"] length]||[info[@"category"] isEqual:@"Unknown"]){_errors[physical]=@"已读到电量，设备名称或类型尚未确认";continue;}
                 [self storeReading:reading physical:physical slot:slot name:info[@"name"] category:info[@"category"]];found=YES;
             }
             if(found)[_errors removeObjectForKey:physical];else if(!_errors[physical])_errors[physical]=@"未找到支持的电量回复；可能休眠或协议尚未适配";
@@ -542,7 +559,6 @@ static void BBDrawDeviceSeparator(CGFloat width, CGFloat y) {
 }
 @interface BBFlippedView:NSView
 @property CGFloat groupHeight;
-@property CGFloat deviceRowHeight;
 @property BOOL settingsGroup;
 @end
 @implementation BBFlippedView
@@ -551,9 +567,6 @@ static void BBDrawDeviceSeparator(CGFloat width, CGFloat y) {
     NSRect rect=NSMakeRect(0,0,self.bounds.size.width,_groupHeight);
     [BBGroupedColor(NO) setFill];[[NSBezierPath bezierPathWithRoundedRect:rect xRadius:12 yRadius:12] fill];
     if(_settingsGroup){[BBGroupedColor(YES) setFill];NSRectFill(NSMakeRect(16,56,MAX(0,rect.size.width-32),0.5));}
-    for (CGFloat y = _deviceRowHeight; _deviceRowHeight > 0 && y < _groupHeight; y += _deviceRowHeight) {
-        BBDrawDeviceSeparator(rect.size.width, y-0.5);
-    }
 }
 @end
 @protocol BBMappingTarget <NSObject>
@@ -765,15 +778,6 @@ static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*colo
 @property BBFlippedView*devicesView;
 @property BBFlippedView*displayGroup;
 @property BBFlippedView*wirelessGroup;
-@property BBFlippedView *diskGroup;
-@property NSTextField *diskHeading;
-@property NSDictionary *diskSnapshot;
-@property NSTimeInterval lastDiskRefresh;
-@property BOOL diskScanRunning;
-@property BOOL diskRefreshPending;
-@property NSMutableSet<NSNumber *> *ejectingDisks;
-@property (assign) DASessionRef diskSession;
-@property NSTimer *diskChangeTimer;
 @property BBFlippedView*settingsGroup;
 @property NSTextField*displayHeading;
 @property NSTextField*wirelessHeading;
@@ -792,22 +796,7 @@ static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*colo
 @property BOOL terminationPending;
 @property BOOL terminationReady;
 @property BOOL terminationReplyPending;
-- (void)scheduleDiskRefresh;
 @end
-static void diskAppearedOrDisappeared(DADiskRef disk, void *context) {
-    [(__bridge BBApp *)context scheduleDiskRefresh];
-}
-static void diskVolumePathChanged(DADiskRef disk, CFArrayRef keys, void *context) {
-    [(__bridge BBApp *)context scheduleDiskRefresh];
-}
-static void diskEjected(DADiskRef disk, DADissenterRef dissenter, void *context) {
-    void (^complete)(DAReturn) = CFBridgingRelease(context);
-    complete(dissenter ? DADissenterGetStatus(dissenter) : kDAReturnSuccess);
-}
-static void diskUnmountedForEject(DADiskRef disk, DADissenterRef dissenter, void *context) {
-    if (dissenter) diskEjected(disk, dissenter, context);
-    else DADiskEject(disk, kDADiskEjectOptionDefault, diskEjected, context);
-}
 static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButton*b=[NSButton buttonWithTitle:title target:target action:action];b.frame=frame;return b;}
 @implementation BBApp
 - (BOOL)installIfNeeded {
@@ -898,7 +887,7 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(reopenNotification:) name:@"local.batterybridge.showSettings" object:BundleID];
     [self createStatusItem];
     self.engine=[BBEngine new];self.thread=[[NSThread alloc]initWithTarget:_engine selector:@selector(run) object:nil];self.thread.name=@"DeviceBridge HID";[_thread start];
-    if(!BBTestingUI){self.displays=[BBDisplayController new];[_displays start];[self startWatchingDisks];}
+    if(!BBTestingUI){self.displays=[BBDisplayController new];[_displays start];}
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(wake:) name:NSWorkspaceDidWakeNotification object:nil];
     if(!BBTestingUI&&[BBPreferences() boolForKey:@"AutoStartEnabled"]&&SMAppService.mainAppService.status==SMAppServiceStatusNotRegistered){NSError*e=nil;[SMAppService.mainAppService registerAndReturnError:&e];}
     self.timer=[NSTimer scheduledTimerWithTimeInterval:2 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
@@ -906,7 +895,9 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     if(!BBTestingUI){self.nativeAudio=[DBNativeAudioSetup new];__weak BBApp *weak=self;
         self.displays.volumeBridgesChanged=^(NSArray *rows,BOOL userInitiated){[weak.nativeAudio updateDisplayBridges:rows userInitiated:userInitiated];};
         [self.nativeAudio updateDisplayBridges:self.displays.snapshot userInitiated:NO];
-        dispatch_async(dispatch_get_main_queue(),^{[self.displays beginMediaKeyOnboarding];[self.nativeAudio beginOnboarding];});}
+        dispatch_async(dispatch_get_main_queue(),^{
+            [self.displays beginMediaKeyOnboarding];[self.nativeAudio beginOnboarding];
+        });}
 }
 - (void)createStatusItem {
     self.statusItem=[NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
@@ -979,99 +970,6 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
 
 - (void)wake:(NSNotification*)n {[_engine kick];}
 - (BOOL)applicationShouldHandleReopen:(NSApplication*)sender hasVisibleWindows:(BOOL)visible {[self showWindow];return YES;}
-- (void)startWatchingDisks {
-    _diskSession = DASessionCreate(kCFAllocatorDefault);
-    if (!_diskSession) return;
-    void *context = (__bridge void *)self;
-    DARegisterDiskAppearedCallback(_diskSession, kDADiskDescriptionMatchMediaWhole, diskAppearedOrDisappeared, context);
-    DARegisterDiskDisappearedCallback(_diskSession, kDADiskDescriptionMatchMediaWhole, diskAppearedOrDisappeared, context);
-    NSArray *volumePath = @[(__bridge NSString *)kDADiskDescriptionVolumePathKey];
-    DARegisterDiskDescriptionChangedCallback(_diskSession, NULL, (__bridge CFArrayRef)volumePath, diskVolumePathChanged, context);
-    DASessionSetDispatchQueue(_diskSession, dispatch_get_main_queue());
-}
-- (void)scheduleDiskRefresh {
-    // A single disk can generate multiple partition and volume events.
-    [_diskChangeTimer invalidate];
-    _diskChangeTimer = [NSTimer timerWithTimeInterval:0.5 target:self selector:@selector(refreshAfterDiskChange:) userInfo:nil repeats:NO];
-    [NSRunLoop.mainRunLoop addTimer:_diskChangeTimer forMode:NSRunLoopCommonModes];
-}
-- (void)refreshAfterDiskChange:(NSTimer *)timer {
-    _diskChangeTimer = nil;
-    [self refreshDisks:YES];
-}
-- (void)refreshDisks:(BOOL)force {
-    if (BBTestingUI) return;
-    if (_diskScanRunning) {
-        if (force) _diskRefreshPending = YES;
-        return;
-    }
-    if (!force) {
-        if (!_window.isVisible) return;
-        NSTimeInterval interval = BBInterval([BBPreferences() objectForKey:@"ReportInterval"]);
-        if (_diskSnapshot && NSProcessInfo.processInfo.systemUptime - _lastDiskRefresh < interval) return;
-    }
-    _diskScanRunning = YES;
-    NSDictionary *snapshotBeforeScan = _diskSnapshot;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSDictionary *snapshot = DBReadDisks();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.diskScanRunning = NO;
-            // Keep a completed eject from being undone by a scan already in flight.
-            if (self.diskSnapshot == snapshotBeforeScan) {
-                self.lastDiskRefresh = NSProcessInfo.processInfo.systemUptime;
-                self.diskSnapshot = snapshot;
-            }
-            if (self.diskRefreshPending) {
-                self.diskRefreshPending = NO;
-                [self refreshDisks:YES];
-            }
-            [self refresh];
-        });
-    });
-}
-
-- (void)ejectDisk:(NSButton *)sender {
-    NSDictionary *record = sender.cell.representedObject;
-    NSNumber *identity = record[@"ejectIdentifier"];
-    if (!_diskSession || !identity || [_ejectingDisks containsObject:identity]) return;
-
-    NSString *device = [@"/dev/" stringByAppendingString:record[@"identifier"]];
-    DADiskRef disk = DADiskCreateFromBSDName(kCFAllocatorDefault, _diskSession, device.fileSystemRepresentation);
-    if (![DBDiskEjectIdentifier(disk) isEqual:identity]) {
-        if (disk) CFRelease(disk);
-        [self refreshDisks:YES];
-        return;
-    }
-
-    if (!_ejectingDisks) _ejectingDisks = [NSMutableSet new];
-    [_ejectingDisks addObject:identity];
-    sender.enabled = NO;
-    void (^complete)(DAReturn) = ^(DAReturn result) {
-        [self.ejectingDisks removeObject:identity];
-        if (result == kDAReturnSuccess) {
-            NSMutableArray *remaining = [NSMutableArray new];
-            for (NSDictionary *row in self.diskSnapshot[@"rows"])
-                if (![row[@"ejectIdentifier"] isEqual:identity]) [remaining addObject:row];
-            self.diskSnapshot = @{@"rows": remaining, @"status": @"未发现硬盘"};
-        } else {
-            sender.enabled = YES;
-            if (self.window.isVisible) {
-                NSAlert *alert = [NSAlert new];
-                alert.messageText = @"无法弹出硬盘";
-                alert.informativeText = result == kDAReturnBusy
-                    ? [NSString stringWithFormat:@"%@ 正在使用中。请关闭使用此硬盘的文件和应用后重试。", record[@"title"]]
-                    : [NSString stringWithFormat:@"macOS 无法弹出 %@。", record[@"title"]];
-                [alert beginSheetModalForWindow:self.window completionHandler:nil];
-            }
-        }
-        self.devicesSignature = nil;
-        [self refreshDisks:YES];
-        [self refresh];
-    };
-    DADiskUnmount(disk, kDADiskUnmountOptionWhole, diskUnmountedForEject, (__bridge_retained void *)[complete copy]);
-    CFRelease(disk);
-}
-
 - (void)buildWindow {
     if(_window)return;
     self.window=[[NSWindow alloc]initWithContentRect:NSMakeRect(0,0,720,700) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];
@@ -1084,13 +982,10 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     self.authorizeButton=button(@"授权读取…",self,@selector(permission:),NSMakeRect(584,64,112,28));_authorizeButton.hidden=YES;_authorizeButton.autoresizingMask=NSViewMinXMargin;[_devicesView addSubview:_authorizeButton];
     self.displayHeading=cardLabel(@"显示器",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
     self.wirelessHeading=cardLabel(@"2.4G 设备",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
-    self.diskHeading=cardLabel(@"硬盘",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
     self.generalHeading=cardLabel(@"通用",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
-    for(NSTextField *heading in @[_displayHeading,_wirelessHeading,_diskHeading,_generalHeading])[_devicesView addSubview:heading];
+    for(NSTextField *heading in @[_displayHeading,_wirelessHeading,_generalHeading])[_devicesView addSubview:heading];
     self.displayGroup=[[BBFlippedView alloc]initWithFrame:NSZeroRect];self.wirelessGroup=[[BBFlippedView alloc]initWithFrame:NSZeroRect];
-    self.diskGroup=[[BBFlippedView alloc]initWithFrame:NSZeroRect];
     [_devicesView addSubview:_displayGroup];[_devicesView addSubview:_wirelessGroup];
-    [_devicesView addSubview:_diskGroup];
     self.settingsGroup=[[BBFlippedView alloc]initWithFrame:NSMakeRect(24,0,672,116)];_settingsGroup.groupHeight=116;_settingsGroup.settingsGroup=YES;[_devicesView addSubview:_settingsGroup];
     self.heading=cardLabel(@"自动更新",NSMakeRect(16,18,200,20),[NSFont systemFontOfSize:13],NSColor.labelColor);[_settingsGroup addSubview:_heading];
     self.intervalPicker=[[NSPopUpButton alloc]initWithFrame:NSMakeRect(520,15,136,26) pullsDown:NO];_intervalPicker.target=self;_intervalPicker.action=@selector(pickInterval:);_intervalPicker.autoresizingMask=NSViewMinXMargin;_intervalPicker.accessibilityLabel=@"自动更新周期";
@@ -1112,7 +1007,6 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
 - (void)refresh {
     NSTimeInterval interval=BBInterval([BBPreferences() objectForKey:@"ReportInterval"]);
     _statusItem.button.toolTip=[NSString stringWithFormat:@"%@ · 设备状态与显示器控制 · 每%@上报",BBApplicationTitle(),BBIntervalLabel(interval)];if(!_window)return;
-    [self refreshDisks:NO];
     NSArray*rows=[[_engine status] arrayByAddingObjectsFromArray:_displays.snapshot?:@[]];_heading.stringValue=@"自动更新";
     for(NSMenuItem*i in _intervalPicker.itemArray)if([i.representedObject doubleValue]==interval){[_intervalPicker selectItem:i];break;}
     _autoStartSwitch.state=[BBPreferences() boolForKey:@"AutoStartEnabled"]?NSControlStateValueOn:NSControlStateValueOff;
@@ -1127,7 +1021,7 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
             if (row.isTrackingBrightness || row.isEditingPercent) return;
         }
     }
-    NSString*signature=[NSString stringWithFormat:@"%@:%@:%ld",rows,_diskSnapshot,(long)(NSDate.date.timeIntervalSince1970/120)];if([signature isEqual:_devicesSignature])return;_devicesSignature=signature;
+    NSString*signature=[NSString stringWithFormat:@"%@:%ld",rows,(long)(NSDate.date.timeIntervalSince1970/120)];if([signature isEqual:_devicesSignature])return;_devicesSignature=signature;
     NSPoint origin=_devicesScroll.contentView.bounds.origin;
     _devicesScroll.autohidesScrollers=NO;[_devicesScroll tile];
     CGFloat documentWidth=MAX(1,_devicesScroll.contentSize.width),width=MAX(1,documentWidth-48),y=100;
@@ -1147,74 +1041,6 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
         }
         [group setNeedsDisplay:YES];y+=groupHeight+28;
     }
-    _diskHeading.frame=NSMakeRect(26,y,MAX(1,width-4),20);y+=32;
-    NSArray *diskRows = _diskSnapshot[@"rows"];
-    CGFloat diskRowHeight = 120, diskGroupHeight = diskRows.count ? diskRows.count * diskRowHeight : 64;
-    _diskGroup.frame = NSMakeRect(24,y,width,diskGroupHeight);
-    _diskGroup.groupHeight = diskGroupHeight;
-    _diskGroup.deviceRowHeight = diskRows.count ? diskRowHeight : 0;
-    for (NSView *view in _diskGroup.subviews.copy) [view removeFromSuperview];
-    NSFont *metricFont = [NSFont systemFontOfSize:11];
-    if (!diskRows.count) {
-        NSString *status = _diskSnapshot[@"status"] ?: (BBTestingUI ? @"未发现硬盘" : @"正在读取硬盘…");
-        [_diskGroup addSubview:cardLabel(status,NSMakeRect(72,22,width-88,20),metricFont,NSColor.secondaryLabelColor)];
-    }
-    NSArray *metricNames = @[@"总读取/总合并", @"已用/总计", @"温度", @"健康度", @"通电次数", @"通电小时"];
-    NSImage *diskIcon = [NSImage imageWithSystemSymbolName:@"internaldrive" accessibilityDescription:nil];
-    BOOL hasEjectButton = NO;
-    for (NSDictionary *record in diskRows) if (record[@"ejectIdentifier"]) { hasEjectButton = YES; break; }
-    CGFloat ejectWidth = 58;
-    [diskRows enumerateObjectsUsingBlock:^(NSDictionary *record, NSUInteger index, BOOL *stop) {
-        CGFloat top = index * diskRowHeight;
-        CGFloat iconSize = 40;
-        CGFloat iconY = top + (diskRowHeight - iconSize) / 2;
-        NSImageView *icon = [[NSImageView alloc] initWithFrame:NSMakeRect(16,iconY,iconSize,iconSize)];
-        icon.image = diskIcon;
-        icon.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:28 weight:NSFontWeightRegular];
-        icon.contentTintColor = NSColor.secondaryLabelColor;
-        [_diskGroup addSubview:icon];
-        CGFloat titleX = 72, titleY = top + 12, availableWidth = width - titleX - 16;
-        if (hasEjectButton) availableWidth -= ejectWidth + 12;
-        NSString *diskTitle = record[@"title"];
-        NSString *volumeNames = record[@"volumeNames"];
-        if (volumeNames.length) diskTitle = [diskTitle stringByAppendingFormat:@" (%@)", volumeNames];
-        NSTextField *title = cardLabel(diskTitle,NSMakeRect(titleX,titleY,availableWidth,20),[NSFont systemFontOfSize:13 weight:NSFontWeightMedium],NSColor.labelColor);
-        title.toolTip = diskTitle;
-        [_diskGroup addSubview:title];
-        if ([record[@"smartUnavailable"] boolValue]) {
-            NSTextField *warning = cardLabel(@"此磁盘主控不支持读取SMART信息",NSZeroRect,metricFont,NSColor.secondaryLabelColor);
-            CGFloat gap = 12, warningWidth = MIN(ceil(warning.fittingSize.width)+4, availableWidth/2);
-            CGFloat titleWidth = MIN(ceil(title.fittingSize.width)+4, availableWidth-warningWidth-gap);
-            title.frame = NSMakeRect(titleX,titleY,titleWidth,20);
-            warning.frame = NSMakeRect(titleX+titleWidth+gap,titleY,warningWidth,20);
-            warning.toolTip = warning.stringValue;
-            [_diskGroup addSubview:warning];
-        }
-        CGFloat columnWidth = availableWidth / 2;
-        NSArray *values = record[@"metrics"];
-        for (NSUInteger i = 0; i < metricNames.count; i++) {
-            NSString *label = [metricNames[i] stringByAppendingString:@"  "];
-            NSString *value = values[i];
-            NSRect frame = NSMakeRect(titleX+(i%2)*columnWidth,top+43+(i/2)*23,columnWidth-8,20);
-            NSMutableAttributedString *text = [[NSMutableAttributedString alloc] initWithString:label attributes:@{NSFontAttributeName: metricFont, NSForegroundColorAttributeName: NSColor.secondaryLabelColor}];
-            [text appendAttributedString:[[NSAttributedString alloc] initWithString:value attributes:@{NSFontAttributeName: metricFont, NSForegroundColorAttributeName: NSColor.labelColor}]];
-            NSTextField *metric = cardLabel(@"",frame,metricFont,NSColor.labelColor);
-            metric.attributedStringValue = text;
-            metric.toolTip = text.string;
-            [_diskGroup addSubview:metric];
-        }
-        if (record[@"ejectIdentifier"]) {
-            NSButton *eject = button(@"弹出", self, @selector(ejectDisk:), NSMakeRect(width-16-ejectWidth,top+(diskRowHeight-28)/2,ejectWidth,28));
-            eject.bezelStyle = NSBezelStyleRounded;
-            eject.cell.representedObject = record;
-            eject.enabled = ![_ejectingDisks containsObject:record[@"ejectIdentifier"]];
-            eject.accessibilityIdentifier = @"DiskEject";
-            eject.accessibilityLabel = [@"弹出 " stringByAppendingString:diskTitle];
-            [_diskGroup addSubview:eject];
-        }
-    }];
-    [_diskGroup setNeedsDisplay:YES];
-    y += diskGroupHeight + 28;
     _generalHeading.frame=NSMakeRect(26,y,MAX(1,width-4),20);y+=32;
     _settingsGroup.frame=NSMakeRect(24,y,width,116);y+=140;
     _devicesView.frame=NSMakeRect(0,0,documentWidth,MAX(y,_devicesScroll.contentSize.height));
@@ -1228,7 +1054,7 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     if(!BBTestingUI&&IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)){[_engine kick];[self refresh];return;}
     [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"]];
 }
-- (void)rescan:(id)sender {[_engine kick];[_displays refreshControls];[self refreshDisks:YES];}
+- (void)rescan:(id)sender {[_engine kick];[_displays refreshControls];}
 - (void)login:(id)sender {if(!BBTestingUI)[SMAppService openSystemSettingsLoginItems];}
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
     if(BBTestingUI||!_displays||_terminationReady)return NSTerminateNow;
@@ -1261,12 +1087,6 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     }];
 }
 - (void)applicationWillTerminate:(NSNotification*)n {
-    if (_diskSession) {
-        DASessionSetDispatchQueue(_diskSession, NULL);
-        CFRelease(_diskSession);
-        _diskSession = NULL;
-    }
-    [_diskChangeTimer invalidate];
     [_nativeAudio stop];[_displays stop];_engine.stopping=YES;[_timer invalidate];if(_lockFD>=0)close(_lockFD);
 }
 @end

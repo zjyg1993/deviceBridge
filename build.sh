@@ -13,12 +13,12 @@ rm -rf "${bundle_dir}"
 mkdir -p "${bundle_dir}/Contents/MacOS" "${bundle_dir}/Contents/Resources"
 clang -fobjc-arc -fblocks -O2 -Wall -Wextra -Wno-unused-parameter \
   -arch arm64 -arch x86_64 -mmacosx-version-min=13.0 \
-  -framework Cocoa -framework DiskArbitration -framework IOKit -framework ServiceManagement -framework CoreAudio -framework ApplicationServices \
-  "${project_dir}/Sources/NativeAudioSetup.m" "${project_dir}/Sources/NativeProxyAudio.m" "${project_dir}/Sources/Disks.m" "${project_dir}/Sources/main.m" "${project_dir}/Sources/Protocol.m" "${project_dir}/Sources/Policy.m" "${project_dir}/Sources/NativeBrightnessBridge.m" "${project_dir}/Sources/Display.m" "${project_dir}/Sources/DisplayDDC.m" \
+  -framework Cocoa -framework IOKit -framework ServiceManagement -framework CoreAudio -framework ApplicationServices \
+  "${project_dir}/Sources/NativeAudioSetup.m" "${project_dir}/Sources/NativeProxyAudio.m" "${project_dir}/Sources/main.m" "${project_dir}/Sources/Protocol.m" "${project_dir}/Sources/Policy.m" "${project_dir}/Sources/NativeBrightnessBridge.m" "${project_dir}/Sources/Display.m" "${project_dir}/Sources/DisplayDDC.m" \
   -o "${bundle_dir}/Contents/MacOS/DeviceBridge"
 python3 - "${bundle_dir}/Contents/Info.plist" <<'PY'
 import plistlib,sys
-p={'CFBundleIdentifier':'local.batterybridge.agent','CFBundleName':'DeviceBridge','CFBundleDisplayName':'DeviceBridge','CFBundleExecutable':'DeviceBridge','CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.9.8','CFBundleVersion':'48','LSMinimumSystemVersion':'13.0','LSUIElement':True,'CFBundleIconFile':'AppIcon','NSHighResolutionCapable':True,'NSHumanReadableCopyright':'DeviceBridge · local utility · preview'}
+p={'CFBundleIdentifier':'local.batterybridge.agent','CFBundleName':'DeviceBridge','CFBundleDisplayName':'DeviceBridge','CFBundleExecutable':'DeviceBridge','CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.9.9','CFBundleVersion':'49','LSMinimumSystemVersion':'13.0','LSUIElement':True,'CFBundleIconFile':'AppIcon','NSHighResolutionCapable':True,'NSHumanReadableCopyright':'DeviceBridge · local utility · preview'}
 with open(sys.argv[1],'wb') as f:plistlib.dump(p,f)
 PY
 icon_work="${output_dir}/icon-work"
@@ -53,7 +53,6 @@ clang -fobjc-arc -fblocks -framework Cocoa -framework CoreAudio -I "${project_di
 mkdir -p "${bundle_dir}/Contents/Helpers"
 cp "${project_dir}/experiments/native-bridge/build.noindex/native-bridge" "${bundle_dir}/Contents/Helpers/native-bridge"
 cp "${project_dir}/experiments/native-bridge/README.md" "${bundle_dir}/Contents/Resources/NativeBridge-README.md"
-/bin/zsh "${project_dir}/build-smartctl.sh" "${bundle_dir}"
 # Restricted HID entitlement needs an Apple-authorized provisioning profile.
 # Never add it to an ad-hoc signature: macOS can terminate that executable.
 signing_identity="${DEVICEBRIDGE_SIGN_IDENTITY:--}"
@@ -79,8 +78,8 @@ printf '%s\n' "Built: ${bundle_dir}"
 clang -fobjc-arc -framework Foundation -I "${project_dir}/Sources" "${project_dir}/Sources/Policy.m" "${project_dir}/tests/PolicyTests.m" -o "${output_dir}/policy-tests"
 "${output_dir}/policy-tests"
 clang -fobjc-arc -fblocks -Wno-unused-parameter -mmacosx-version-min=13.0 \
-  -framework Cocoa -framework DiskArbitration -framework IOKit -framework ServiceManagement -framework CoreAudio -framework ApplicationServices \
-  "${project_dir}/Sources/NativeAudioSetup.m" "${project_dir}/Sources/NativeProxyAudio.m" "${project_dir}/Sources/Disks.m" "${project_dir}/tests/InterfaceTests.m" "${project_dir}/Sources/Protocol.m" "${project_dir}/Sources/Policy.m" "${project_dir}/Sources/NativeBrightnessBridge.m" "${project_dir}/Sources/Display.m" "${project_dir}/Sources/DisplayDDC.m" \
+  -framework Cocoa -framework IOKit -framework ServiceManagement -framework CoreAudio -framework ApplicationServices \
+  "${project_dir}/Sources/NativeAudioSetup.m" "${project_dir}/Sources/NativeProxyAudio.m" "${project_dir}/tests/InterfaceTests.m" "${project_dir}/Sources/Protocol.m" "${project_dir}/Sources/Policy.m" "${project_dir}/Sources/NativeBrightnessBridge.m" "${project_dir}/Sources/Display.m" "${project_dir}/Sources/DisplayDDC.m" \
   -o "${output_dir}/interface-tests"
 "${output_dir}/interface-tests"
 

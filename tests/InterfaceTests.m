@@ -15,6 +15,41 @@ static void ensure(BOOL ok,const char*message){if(!ok){fprintf(stderr,"FAIL: %s\
     return match(f)?f:nil;
 }
 @end
+@interface BBFakeLogitechChannel:BBChannel
+@property NSUInteger timeouts;
+@property uint8_t unifiedIndex;
+@property uint8_t delayedHeader;
+@property NSUInteger legacyLookups;
+@end
+@implementation BBFakeLogitechChannel
+- (NSDictionary*)exchange:(uint8_t)rid payload:(NSData*)data matching:(BOOL(^)(NSDictionary*))match {
+    const uint8_t*p=data.bytes;
+    uint8_t reply[20]={0x11,p[0],p[1],p[2]};
+    if(p[1]==0&&p[4]==0x04&&_timeouts){
+        _timeouts--;
+        _delayedHeader=p[2];
+        self.lastError=kIOReturnTimeout;
+        return nil;
+    }
+    if(_delayedHeader){
+        reply[3]=_delayedHeader;reply[4]=6;reply[6]=5;
+        NSDictionary*late=@{@"id":@0x11,@"data":[NSData dataWithBytes:reply length:sizeof reply]};
+        ensure(!match(late),"a late Logitech feature reply cannot match a new query");
+        reply[3]=p[2];reply[4]=0;reply[6]=0;
+        _delayedHeader=0;
+    }
+    if(p[1]==0){
+        if(p[4]==0x00)_legacyLookups++;
+        reply[4]=p[4]==0x04?_unifiedIndex:6;
+    }else{
+        reply[4]=(p[2]>>4)==1?0x5c:0x0f;
+        reply[5]=(p[2]>>4)==1?8:7;
+    }
+    self.lastError=kIOReturnSuccess;
+    NSDictionary*frame=@{@"id":@0x11,@"data":[NSData dataWithBytes:reply length:sizeof reply]};
+    return match(frame)?frame:nil;
+}
+@end
 @interface BBPermissionDisplayController:BBDisplayController
 @property BOOL trusted;
 @property BOOL activeTap;
@@ -145,6 +180,16 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     ensure(BBCompxBattery(compx)==nil&&[compx.commands isEqual:@[@3]],"offline Compx receiver never queried for cached battery");
     compx.online=YES;[compx.commands removeAllObjects];
     ensure([BBCompxBattery(compx)[@"percent"] intValue]==53&&[compx.commands isEqual:@[@3,@4]],"online check precedes every Compx battery read");
+    BBFakeLogitechChannel*logitech=[BBFakeLogitechChannel new];
+    logitech.unifiedIndex=6;logitech.timeouts=1;
+    ensure([BBLogitechBattery(logitech,1)[@"percent"] intValue]==92&&logitech.legacyLookups==0,
+           "retry a timed-out Logitech unified battery lookup and read the correct percentage");
+    logitech.timeouts=2;
+    ensure(!BBLogitechBattery(logitech,1)&&logitech.legacyLookups==0,
+           "Logitech lookup timeout cannot trigger legacy battery decoding");
+    logitech.unifiedIndex=0;
+    ensure([BBLogitechBattery(logitech,1)[@"percent"] intValue]==15&&logitech.legacyLookups==1,
+           "Logitech legacy battery percentage is accepted after explicit unified feature absence");
     uint8_t omniKeyboardDescriptor[]={0x85,2,0x75,8,0x95,63,0x91,2,0x81,2};
     NSMutableDictionary*omniKeyboard=[@{@"Transport":@"USB",@"VendorID":@0x0b05,@"ProductID":@0x1ace,@"LocationID":@123,@"USBInterfaceNumber":@2,@"PrimaryUsagePage":@0xff00,@"PrimaryUsage":@2,@"ReportDescriptor":[NSData dataWithBytes:omniKeyboardDescriptor length:sizeof omniKeyboardDescriptor]} mutableCopy];
     ensure(BBASUSKeyboardInterfaceMatches(omniKeyboard,@"0b05:1ace:123"),"OMNI keyboard channel resolves on same receiver");
@@ -217,43 +262,7 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     app.engine.snapshot=fixtures;
     NSImage*brand=BBStatusIcon();ensure(brand.isTemplate&&brand.size.width==20,"brand menu bar icon is a monochrome system template");
     [app buildWindow];
-    NSDictionary *diskFixture = @{@"rows": @[
-        @{@"title": @"APPLE SSD · disk0", @"volumeNames": @"Macintosh HD",
-          @"metrics": @[@"1.37 TB / 1.21 TB", @"86.06 GB / 500.28 GB", @"25 °C", @"100%", @"155 次", @"13 小时"]},
-        @{@"title": @"USB Drive · disk2", @"identifier": @"disk2", @"ejectIdentifier": @123, @"volumeNames": @"", @"smartUnavailable": @YES,
-          @"metrics": @[@"— / —", @"—", @"—", @"—", @"—", @"—"]}
-    ]};
-    app.diskSnapshot = diskFixture;
     [app refresh];
-    NSMutableArray<NSImage *> *diskIcons = [NSMutableArray new];
-    NSMutableArray<NSString *> *diskLabels = [NSMutableArray new];
-    NSMutableArray<NSButton *> *ejectButtons = [NSMutableArray new];
-    NSTextField *readMetric = nil;
-    for (NSView *view in app.diskGroup.subviews) {
-        if ([view isKindOfClass:NSImageView.class] && ((NSImageView *)view).image)
-            [diskIcons addObject:((NSImageView *)view).image];
-        if ([view isKindOfClass:NSTextField.class]) {
-            NSTextField *field = (NSTextField *)view;
-            [diskLabels addObject:field.stringValue];
-            if ([field.stringValue hasPrefix:@"总读取/总合并  1.37"]) readMetric = field;
-        }
-        if ([view isKindOfClass:NSButton.class]) [ejectButtons addObject:(NSButton *)view];
-    }
-    ensure(diskIcons.count == 2 && [diskIcons[0] isEqual:diskIcons[1]], "all physical disks use the same icon");
-    ensure([diskLabels containsObject:@"APPLE SSD · disk0 (Macintosh HD)"] &&
-           [diskLabels containsObject:@"USB Drive · disk2"], "only disks with volume names get a parenthesized suffix");
-    ensure([diskLabels containsObject:@"总读取/总合并  1.37 TB / 1.21 TB"] &&
-           [diskLabels containsObject:@"总读取/总合并  — / —"], "read and write totals share one field");
-    NSAttributedString *styledMetric = readMetric.attributedStringValue;
-    ensure([[styledMetric attribute:NSForegroundColorAttributeName atIndex:0 effectiveRange:NULL] isEqual:NSColor.secondaryLabelColor] &&
-           [[styledMetric attribute:NSForegroundColorAttributeName atIndex:styledMetric.length-1 effectiveRange:NULL] isEqual:NSColor.labelColor],
-           "disk metric labels and values use distinct text colors");
-    NSButton *eject = ejectButtons.firstObject;
-    ensure(ejectButtons.count == 1 && [eject.title isEqual:@"弹出"] &&
-           [eject.cell.representedObject[@"identifier"] isEqual:@"disk2"] &&
-           NSMaxX(eject.frame) == NSWidth(app.diskGroup.bounds)-16 && NSMidY(eject.frame) == 180,
-           "only the ejectable disk gets a button, centered at the right edge of its row");
-    app.diskSnapshot = nil;
     BOOL hasListTitle=NO;for(NSView*v in app.devicesView.subviews)if([v isKindOfClass:NSTextField.class]&&[[(NSTextField*)v stringValue] isEqual:@"设备列表"])hasListTitle=YES;
     ensure(hasListTitle,"main window title uses device list wording");
     for(NSView *view in app.settingsGroup.subviews)if([view isKindOfClass:NSTextField.class])ensure(![[(NSTextField*)view stringValue] isEqual:@"登录 Mac 后自动运行 DeviceBridge"],"login switch has no redundant description text");
@@ -381,6 +390,8 @@ int main(int argc,const char*argv[]){@autoreleasepool{
         for(NSValue*size in @[[NSValue valueWithSize:NSMakeSize(560,420)],[NSValue valueWithSize:NSMakeSize(660,330)],[NSValue valueWithSize:NSMakeSize(900,620)],[NSValue valueWithSize:NSMakeSize(1400,700)]]){
             [app.window setContentSize:size.sizeValue];app.devicesSignature=nil;[app refresh];
             CGFloat available=app.devicesScroll.contentSize.width;
+            ensure(NSMinY(app.generalHeading.frame)-NSMaxY(app.wirelessGroup.frame)==28,
+                   "general settings follow the wireless device list with the standard section gap");
             ensure(app.wirelessGroup.subviews.count==many.count,"all wireless rows remain present after resize");
             for(NSView*v in app.devicesView.subviews)ensure(NSMinX(v.frame)>=0&&NSMaxX(v.frame)<=available+0.5,"card stays within viewport including legacy scrollbar");
             ensure(app.devicesView.frame.size.width<=available+0.5&&!app.devicesScroll.hasHorizontalScroller,"no horizontal document overflow");
@@ -421,7 +432,7 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     ensure(![BBPowerDetails(@"test.yjx",@"YJX",@"Mouse",contradictory)[@"Is Charged"] boolValue],"macOS never receives charging and charged simultaneously");
     if(argc>1){
         BBPermissionDisplayController *permissionDisplays=[BBPermissionDisplayController new];app.displays=permissionDisplays;[app.displays setValue:@[displayFixture] forKey:@"snapshot"];
-        app.diskSnapshot=diskFixture;app.engine.snapshot=fixtures;[app.window setContentSize:NSMakeSize(660,600)];app.devicesSignature=nil;[app refresh];
+        app.engine.snapshot=fixtures;[app.window setContentSize:NSMakeSize(660,600)];app.devicesSignature=nil;[app refresh];
         if(argc>2)app.window.appearance=[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
         NSView*root=app.devicesView;
         NSBitmapImageRep*rep=[[NSBitmapImageRep alloc]initWithBitmapDataPlanes:NULL pixelsWide:(NSInteger)(root.bounds.size.width*2) pixelsHigh:(NSInteger)(root.bounds.size.height*2) bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:0 bitsPerPixel:0];rep.size=root.bounds.size;
