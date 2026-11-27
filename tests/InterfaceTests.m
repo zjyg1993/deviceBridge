@@ -80,6 +80,22 @@ static NSEvent *commandKey(NSString *key, unsigned short keyCode, NSWindow *wind
 @end
 int main(int argc,const char*argv[]){@autoreleasepool{
     BBTestingUI=YES;[NSApplication sharedApplication];[BBPreferences() registerDefaults:@{@"ReportInterval":@3600,@"AutoStartEnabled":@YES}];
+    ensure([NSImage imageWithSystemSymbolName:@"gamecontroller" accessibilityDescription:nil]!=nil,"macOS supplies the game controller icon");
+    NSString *gamepadID=@"test.gamepad";
+    ensure(mappingEnabled(gamepadID,@"Game Controller")&&!mappingEnabled(gamepadID,@"Mouse"),"only game controllers opt in to mapping by default");
+    [BBPreferences() setObject:@{gamepadID:@NO} forKey:@"MappedDevices"];
+    ensure(!mappingEnabled(gamepadID,@"Game Controller"),"controller mapping can be disabled");
+    [BBPreferences() setObject:@{} forKey:@"MappedDevices"];
+    NSDictionary *gamepadPower=BBPowerDetails(gamepadID,@"Pro Controller",@"Game Controller",
+        @{@"percent":@60,@"transport":@"Bluetooth"});
+    ensure([gamepadPower[@"Transport Type"] isEqual:@"Bluetooth"]&&[gamepadPower[@"Accessory Category"] isEqual:@"Game Controller"]&&
+        [gamepadPower[@"Current Capacity"] intValue]==60,"a game controller publishes its battery as a Bluetooth accessory");
+    ensure(receiverKind(@{@"Transport":@"USB",@"VendorID":@0x045e,@"ProductID":@0x028e,@"Product":@"Flydigi Direwolf 4"})==BBReceiverNone,
+        "Xbox-compatible Flydigi is excluded from USB receiver polling");
+    uint8_t flydigiDescriptor[]={0x85,3,0x75,8,0x95,31,0x91,2,0x85,4,0x81,2};
+    ensure(receiverKind(@{@"Transport":@"USB",@"VendorID":@0x37d7,@"ProductID":@0x2401,@"PrimaryUsagePage":@0xffa0,
+        @"ReportDescriptor":[NSData dataWithBytes:flydigiDescriptor length:sizeof flydigiDescriptor]})==BBReceiverNone,
+        "Flydigi vendor HID receivers are excluded from USB receiver polling");
     // A USB mouse/keyboard usage alone must never qualify as a 2.4G receiver.
     NSMutableDictionary*hid=[@{@"Transport":@"USB",@"VendorID":@0x056a,@"ProductID":@0x0357,@"Product":@"Wacom Intuos Pro M",@"PrimaryUsagePage":@1,@"PrimaryUsage":@2} mutableCopy];
     ensure(receiverKind(hid)==BBReceiverNone,"wired Wacom mouse interface excluded");
@@ -188,9 +204,10 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     ensure(receiverKind(hid)==BBReceiverLogitech,"2026 SUPERSTRIKE receiver does not depend on receiver word in product name");
     [hid removeObjectForKey:@"ReportDescriptor"];ensure(receiverKind(hid)==BBReceiverNone,"SUPERSTRIKE requires HID++ output descriptor");
     BBFakeCompxChannel*compx=[BBFakeCompxChannel new];
-    ensure(BBCompxBattery(compx)==nil&&[compx.commands isEqual:@[@3]],"offline Compx receiver never queried for cached battery");
+    NSNumber *compxOnline=nil;
+    ensure(BBCompxBattery(compx,&compxOnline)==nil&&[compxOnline isEqual:@NO]&&[compx.commands isEqual:@[@3]],"offline Compx receiver never queried for cached battery");
     compx.online=YES;[compx.commands removeAllObjects];
-    ensure([BBCompxBattery(compx)[@"percent"] intValue]==53&&[compx.commands isEqual:@[@3,@4]],"online check precedes every Compx battery read");
+    ensure([BBCompxBattery(compx,&compxOnline)[@"percent"] intValue]==53&&compxOnline.boolValue&&[compx.commands isEqual:@[@3,@4]],"online check precedes every Compx battery read");
     BBFakeLogitechChannel*logitech=[BBFakeLogitechChannel new];
     logitech.unifiedIndex=6;logitech.timeouts=1;
     ensure([BBLogitechBattery(logitech,1)[@"percent"] intValue]==92&&logitech.legacyLookups==0,
@@ -220,15 +237,14 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     app.engine.snapshot=fixtures;[app menuNeedsUpdate:app.statusMenu];
     ensure(app.statusMenu.numberOfItems==2,"wireless reconnection does not add menu entries");
     NSMenuItem*three=[NSMenuItem new];three.representedObject=@10800;[app changeInterval:three];ensure(BBInterval([BBPreferences() objectForKey:@"ReportInterval"])==10800,"interval menu saves three hours");
-    NSMenuItem*mapping=[NSMenuItem new];mapping.representedObject=@"test.mouse";[app toggleMapping:mapping];ensure(mappingEnabled(@"test.mouse"),"mapping can be enabled");[app toggleMapping:mapping];ensure(!mappingEnabled(@"test.mouse"),"mapping can be disabled");
+    NSMenuItem*mapping=[NSMenuItem new];mapping.representedObject=@"test.mouse";[app toggleMapping:mapping];ensure(mappingEnabled(@"test.mouse",@"Mouse"),"mapping can be enabled");[app toggleMapping:mapping];ensure(!mappingEnabled(@"test.mouse",@"Mouse"),"mapping can be disabled");
     ensure(![app applicationShouldTerminateAfterLastWindowClosed:NSApp],"closing window does not terminate app");
     BBDeviceRow*card=[[BBDeviceRow alloc]initWithFrame:NSMakeRect(0,0,640,96) record:fixtures[0]];card.menuTarget=app;
     NSEvent*rightClick=[NSEvent mouseEventWithType:NSEventTypeRightMouseDown location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil eventNumber:0 clickCount:1 pressure:1];
     ensure([card menuForEvent:rightClick]==nil,"connected device row has no context menu");
-    ensure(!card.deleteButton.enabled,"connected device cannot be deleted from its row");
     BOOL hasMappingLabel=NO;
     for(NSView*v in card.subviews){
-        ensure(![v.accessibilityIdentifier isEqual:@"DeviceActions"],"device row has no more-actions button");
+        if([v isKindOfClass:NSButton.class])ensure(v==card.refreshButton,"refresh is the wireless row’s only button");
         if([v isKindOfClass:NSTextField.class]&&[[(NSTextField*)v stringValue] isEqual:@"映射"])hasMappingLabel=YES;
     }
     ensure(hasMappingLabel,"mapping label uses requested wording");
@@ -238,39 +254,20 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     ensure([app.engine.refreshTargets containsObject:@"test.mouse"]&&app.engine.refreshTargets.count==1,"row refresh button targets its own device");
     ensure(!unknown.refreshButton.enabled,"unsupported row disables refresh");
     ensure(card.mappingSwitch.enabled&&!unknown.mappingSwitch.enabled,"mapping switch respects protocol support");
-    card.mappingSwitch.state=NSControlStateValueOn;[card mappingChanged:card.mappingSwitch];ensure(mappingEnabled(@"test.mouse"),"card switch enables mapping");
-    card.mappingSwitch.state=NSControlStateValueOff;[card mappingChanged:card.mappingSwitch];ensure(!mappingEnabled(@"test.mouse"),"card switch disables mapping");
-    NSMutableDictionary*offline=[fixtures[0] mutableCopy];offline[@"connected"]=@NO;offline[@"physical"]=@"test.receiver";
-    BBDeviceRow*offlineCard=[[BBDeviceRow alloc]initWithFrame:NSMakeRect(0,0,640,96) record:offline];offlineCard.menuTarget=app;
-    ensure(!offlineCard.refreshButton.enabled,"offline row disables refresh");
-    ensure(offlineCard.deleteButton.enabled&&NSMinX(offlineCard.deleteButton.frame)>NSMaxX(offlineCard.refreshButton.frame),"offline row offers a delete button to the right of refresh");
-    NSMenu*offlineMenu=[offlineCard menuForEvent:rightClick];
-    NSMenuItem*delete=offlineMenu.itemArray.firstObject;
-    ensure(offlineMenu.numberOfItems==1&&[delete.title isEqual:@"删除设备"]&&delete.action==@selector(deleteDevice:)&&delete.target==app&&[delete.representedObject isEqual:@"test.mouse"],"offline row offers deletion for its own device");
-    app.engine.known[@"test.mouse"]=offline;app.engine.samples[@"test.mouse"]=@{@"updated":@(now)};
-    app.engine.snapshot=@[offline];
+    card.mappingSwitch.state=NSControlStateValueOn;[card mappingChanged:card.mappingSwitch];ensure(mappingEnabled(@"test.mouse",@"Mouse"),"card switch enables mapping");
+    card.mappingSwitch.state=NSControlStateValueOff;[card mappingChanged:card.mappingSwitch];ensure(!mappingEnabled(@"test.mouse",@"Mouse"),"card switch disables mapping");
     [NSApp finishLaunching];
-    [app showWindow];
-    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
-    ensure([NSApp sendAction:delete.action to:delete.target from:delete],"offline menu dispatches deletion");
-    ensure(app.window.attachedSheet && !app.engine.deletionTargets.count,"menu deletion waits for a native confirmation sheet");
-    [app.window endSheet:app.window.attachedSheet returnCode:NSAlertFirstButtonReturn];
-    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.35]];
-    ensure(!app.engine.deletionTargets.count,"cancel leaves the saved device alone");
-    [offlineCard.deleteButton performClick:nil];
-    ensure(app.window.attachedSheet && !app.engine.deletionTargets.count,"trash button also waits for confirmation");
-    [app.window endSheet:app.window.attachedSheet returnCode:NSAlertSecondButtonReturn];
-    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.35]];
-    ensure([app.engine.deletionTargets containsObject:@"test.mouse"],"confirmation queues only the selected device");
-    [app.engine applyDeletions:[NSSet setWithObject:@"test.receiver"]];
-    ensure(app.engine.known[@"test.mouse"]!=nil,"reconnected device is protected from queued deletion");
-    [offlineCard.deleteButton performClick:nil];
-    [app.window endSheet:app.window.attachedSheet returnCode:NSAlertSecondButtonReturn];
-    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.35]];
-    [app.engine applyDeletions:[NSSet set]];
-    ensure(!app.engine.known[@"test.mouse"]&&!app.engine.samples[@"test.mouse"],"deletion clears saved identity and sample");
-    [app.window orderOut:nil];
+    [app buildWindow];
+    [BBPreferences() setObject:@{@"test.mouse":@YES} forKey:@"MappedDevices"];
+    app.engine.snapshot=@[offlineWireless,fixtures[1]];
+    [app refresh];
+    ensure(app.wirelessGroup.subviews.count==1&&
+           [((BBDeviceRow *)app.wirelessGroup.subviews.firstObject).record[@"identity"] isEqual:@"test.keyboard"],
+           "disconnected wireless devices are hidden");
     app.engine.snapshot=fixtures;
+    [app refresh];
+    ensure(app.wirelessGroup.subviews.count==2&&mappingEnabled(@"test.mouse",@"Mouse"),
+           "reconnected devices reappear with their saved mapping");
     NSImage*brand=BBStatusIcon();ensure(brand.isTemplate&&brand.size.width==20,"brand menu bar icon is a monochrome system template");
     [app buildWindow];
     [app refresh];
@@ -291,7 +288,14 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     ensure([app.window.title containsString:Version],"window title exposes the running version");
     BBPermissionDisplayController *permissionDisplays=[BBPermissionDisplayController new];app.displays=permissionDisplays;
     NSDictionary*displayFixture=@{@"identity":@"display:test",@"category":@"Display",@"connected":@YES,@"mappingEnabled":@YES,@"brightnessBridgeEnabled":@YES,@"brightnessBridgeAvailable":@YES,@"volumeBridgeEnabled":@YES,@"audioOutputUID":@"test-hdmi",@"updated":@(now),@"name":@"DELL S2725QS",@"brightness":@{@"percent":@55},@"volume":@{@"percent":@20},@"status":@"DDC 已读取"};
-    [app.displays setValue:@[displayFixture] forKey:@"snapshot"];app.devicesSignature=nil;[app refresh];
+    NSMutableDictionary *offlineDisplay=[displayFixture mutableCopy];
+    offlineDisplay[@"connected"]=@NO;
+    offlineDisplay[@"identity"]=@"display:disconnected";
+    [app.displays setValue:@[offlineDisplay,displayFixture] forKey:@"snapshot"];
+    app.devicesSignature=nil;[app refresh];
+    ensure(app.displayGroup.subviews.count==1&&
+           [((BBDisplayRow *)app.displayGroup.subviews.firstObject).record[@"identity"] isEqual:@"display:test"],
+           "disconnected display rows are hidden");
     ensure(app.authorizeButton.hidden,"shortcut authorization uses first-launch onboarding without a manual button");
     permissionDisplays.listenGranted=YES;[app refresh];
     ensure(!permissionDisplays.mediaKeysAuthorized&&app.authorizeButton.hidden,"listen-only access does not grant shortcuts or restore a manual shortcut button");

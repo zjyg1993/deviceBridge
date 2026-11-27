@@ -1,9 +1,11 @@
 #import <Cocoa/Cocoa.h>
+#import <GameController/GameController.h>
 #import <IOKit/hid/IOHIDManager.h>
 #import <IOKit/hidsystem/IOHIDLib.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <dlfcn.h>
+#import <math.h>
 #import <sys/file.h>
 #import "Protocol.h"
 #import "Policy.h"
@@ -208,9 +210,10 @@ static void reportCallback(void *ctx,IOReturn result,void *sender,IOHIDReportTyp
 - (void)dealloc {if(_opened){IOHIDDeviceRegisterInputReportCallback(_device,_buffer,sizeof(_buffer),NULL,NULL);IOHIDDeviceUnscheduleFromRunLoop(_device,CFRunLoopGetCurrent(),kCFRunLoopDefaultMode);IOHIDDeviceClose(_device,0);}if(_device)CFRelease(_device);}
 @end
 
-static NSDictionary *BBCompxBattery(BBChannel*c){
+static NSDictionary *BBCompxBattery(BBChannel*c, NSNumber **online){
     __block NSDictionary*link=nil,*reading=nil;
     [c exchange:8 payload:BBCompxQuery(3) matching:^BOOL(NSDictionary*f){link=BBCompxDecode(f[@"data"],[f[@"id"] intValue],3);return link!=nil;}];
+    if(online)*online=link[@"online"];
     if(![link[@"online"] boolValue])return nil;
     [c exchange:8 payload:BBCompxQuery(4) matching:^BOOL(NSDictionary*f){reading=BBCompxDecode(f[@"data"],[f[@"id"] intValue],4);return reading!=nil;}];
     return reading;
@@ -265,7 +268,8 @@ static NSDictionary *logitechName(BBChannel*c,uint8_t slot,uint8_t index){
 
 static NSDictionary *BBPowerDetails(NSString*identity,NSString*name,NSString*category,NSDictionary*reading){
     BOOL charging=[reading[@"charging"] boolValue];
-    return @{@"Name":name,@"Type":@"Accessory Source",@"Accessory Category":category,@"Accessory Identifier":identity,@"Transport Type":@"USB",@"Current Capacity":reading[@"percent"],@"Max Capacity":@100,@"Power Source State":charging?@"AC Power":@"Battery Power",@"Is Charging":@(charging),@"Is Charged":@(!charging&&[reading[@"full"] boolValue]),@"Is Present":@YES,@"Low Warn Level":@15};
+    BOOL full=[reading[@"full"] boolValue];
+    return @{@"Name":name,@"Type":@"Accessory Source",@"Accessory Category":category,@"Accessory Identifier":identity,@"Transport Type":reading[@"transport"]?:@"USB",@"Current Capacity":reading[@"percent"],@"Max Capacity":@100,@"Power Source State":(charging||([category isEqual:@"Game Controller"]&&full))?@"AC Power":@"Battery Power",@"Is Charging":@(charging),@"Is Charged":@(!charging&&full),@"Is Present":@YES,@"Low Warn Level":@15};
 }
 static NSString *BBChargeStatus(NSDictionary*record){
     if(![record[@"connected"] boolValue]||![record[@"fresh"] boolValue]||!record[@"charging"])return @"充电状态未知";
@@ -301,6 +305,8 @@ static NSString *BBChargeStatus(NSDictionary*record){
 @property NSMutableDictionary<NSString*,NSString*> *errors;
 @property NSMutableDictionary<NSString*,BBChannel*> *listeners;
 @property NSMutableDictionary<NSString*,NSMutableDictionary*> *yjxDiagnostics;
+@property NSMutableSet<NSString*> *offlineReceivers;
+@property(copy) NSArray<NSDictionary*> *controllerReadings;
 @property NSSet *previousPresent;
 @property NSArray *snapshot;
 @property NSLock *lock;
@@ -308,7 +314,6 @@ static NSString *BBChargeStatus(NSDictionary*record){
 @property BOOL urgent;
 @property BOOL forcePoll;
 @property NSMutableSet<NSString*>*refreshTargets;
-@property NSMutableSet<NSString*>*deletionTargets;
 @property BOOL diagnostic;
 @property NSTimeInterval lastQuery;
 @property IOHIDAccessType lastAccess;
@@ -318,30 +323,77 @@ static NSString *BBChargeStatus(NSDictionary*record){
 - (void)kick;
 - (void)settingsChanged;
 - (void)refreshIdentity:(NSString*)identity;
-- (void)forgetIdentity:(NSString*)identity;
-- (void)applyDeletions:(NSSet*)present;
+- (void)updateControllerReadings:(NSArray<NSDictionary*>*)readings;
 @end
 static NSString *logicalID(NSString *physical,int slot){return [NSString stringWithFormat:@"local.batterybridge.%@.%d",physical,slot];}
-static BOOL mappingEnabled(NSString *identity){return [[BBPreferences() dictionaryForKey:@"MappedDevices"][identity] boolValue];}
+static BOOL BBGameControllerCategory(NSString *category) {return [category isEqual:@"Game Controller"];}
+static BOOL mappingEnabled(NSString *identity, NSString *category){
+    NSNumber *choice=[BBPreferences() dictionaryForKey:@"MappedDevices"][identity];
+    return choice?choice.boolValue:BBGameControllerCategory(category);
+}
+
+static NSDictionary<NSString*,NSString*> *BBControllerTransports(void) {
+    NSMutableDictionary *transports=[NSMutableDictionary new];
+    io_iterator_t iterator=IO_OBJECT_NULL;
+    if(IOServiceGetMatchingServices(kIOMainPortDefault,IOServiceMatching("IOHIDDevice"),&iterator)!=KERN_SUCCESS)return transports;
+    for(io_service_t service=IOIteratorNext(iterator);service;service=IOIteratorNext(iterator)){
+        NSString *name=CFBridgingRelease(IORegistryEntryCreateCFProperty(service,CFSTR("Product"),kCFAllocatorDefault,0));
+        NSString *transport=CFBridgingRelease(IORegistryEntryCreateCFProperty(service,CFSTR("Transport"),kCFAllocatorDefault,0));
+        IOObjectRelease(service);
+        if(![name isKindOfClass:NSString.class]||![transport isKindOfClass:NSString.class])continue;
+        if(!transports[name])transports[name]=transport;
+        else if(![transports[name] isEqual:transport])transports[name]=@"";
+    }
+    IOObjectRelease(iterator);
+    return transports;
+}
+
+static NSArray<NSDictionary*> *BBControllerReadings(void) {
+    NSArray<GCController*> *controllers=GCController.controllers;
+    if(!controllers.count)return @[];
+    NSDictionary *transports=BBControllerTransports();
+    NSMutableDictionary<NSString*,NSNumber*> *occurrences=[NSMutableDictionary new];
+    NSMutableArray *readings=[NSMutableArray new];
+    for(GCController *controller in controllers){
+        NSString *name=controller.vendorName;
+        if(!name.length||controller.isSnapshot)continue;
+        BOOL flydigi=[name rangeOfString:@"Flydigi" options:NSCaseInsensitiveSearch].location!=NSNotFound;
+        BOOL switchPro=[name isEqual:@"Pro Controller"]&&[controller.productCategory isEqual:@"Switch Pro Controller"];
+        if(!flydigi&&!switchPro)continue;
+        if(![transports[name] hasPrefix:@"Bluetooth"])continue;
+        GCDeviceBattery *battery=controller.battery;
+        NSUInteger index=[occurrences[name] unsignedIntegerValue];
+        occurrences[name]=@(index+1);
+        NSString *physical=[NSString stringWithFormat:@"gamepad.bluetooth.%@.%lu",name,(unsigned long)index];
+        NSMutableDictionary *record=[@{@"physical":physical,@"name":name} mutableCopy];
+        float level=battery.batteryLevel;
+        if(battery&&isfinite(level)&&level>=0&&level<=1&&
+           (level>0||battery.batteryState!=GCDeviceBatteryStateUnknown)){
+            NSMutableDictionary *sample=[@{@"percent":@(lroundf(level*100)),@"transport":@"Bluetooth"} mutableCopy];
+            if(battery.batteryState!=GCDeviceBatteryStateUnknown){
+                sample[@"charging"]=@(battery.batteryState==GCDeviceBatteryStateCharging);
+                sample[@"full"]=@(battery.batteryState==GCDeviceBatteryStateFull);
+            }
+            record[@"reading"]=sample;
+        }
+        [readings addObject:record];
+    }
+    return readings;
+}
 @implementation BBEngine
-- (instancetype)init {if((self=[super init])){_sources=[NSMutableDictionary new];_samples=[NSMutableDictionary new];_known=[[BBPreferences() dictionaryForKey:@"KnownDevices"] mutableCopy]?:[NSMutableDictionary new];_errors=[NSMutableDictionary new];_listeners=[NSMutableDictionary new];_yjxDiagnostics=[NSMutableDictionary new];_snapshot=@[];_previousPresent=[NSSet set];_lock=[NSLock new];_forcePoll=YES;_refreshTargets=[NSMutableSet new];_deletionTargets=[NSMutableSet new];_lastAccess=IOHIDCheckAccess(kIOHIDRequestTypeListenEvent);}return self;}
+- (instancetype)init {if((self=[super init])){_sources=[NSMutableDictionary new];_samples=[NSMutableDictionary new];_known=[[BBPreferences() dictionaryForKey:@"KnownDevices"] mutableCopy]?:[NSMutableDictionary new];_errors=[NSMutableDictionary new];_listeners=[NSMutableDictionary new];_yjxDiagnostics=[NSMutableDictionary new];_offlineReceivers=[NSMutableSet new];_snapshot=@[];_previousPresent=[NSSet set];_lock=[NSLock new];_forcePoll=YES;_refreshTargets=[NSMutableSet new];_lastAccess=IOHIDCheckAccess(kIOHIDRequestTypeListenEvent);}return self;}
 - (NSArray*)status {[_lock lock];NSArray*r=[_snapshot copy];[_lock unlock];return r;}
 - (void)kick {[_lock lock];_urgent=YES;_forcePoll=YES;[_lock unlock];}
 - (void)settingsChanged {[_lock lock];_urgent=YES;[_lock unlock];}
-- (void)refreshIdentity:(NSString*)identity {if(!identity.length)return;[_lock lock];[_refreshTargets addObject:identity];_urgent=YES;[_lock unlock];}
-- (void)forgetIdentity:(NSString*)identity {
-    if(!identity.length)return;
-    [_lock lock];[_deletionTargets addObject:identity];_urgent=YES;[_lock unlock];
-}
-- (void)applyDeletions:(NSSet*)present {
-    [_lock lock];NSSet*targets=[_deletionTargets copy];[_deletionTargets removeAllObjects];[_lock unlock];
-    for(NSString*identity in targets){
-        NSDictionary*info=_known[identity];if(!info||[present containsObject:info[@"physical"]])continue;
-        [_known removeObjectForKey:identity];[_samples removeObjectForKey:identity];[_sources removeObjectForKey:identity];
-        void(^clearMapping)(void)=^{NSMutableDictionary*choices=[[BBPreferences() dictionaryForKey:@"MappedDevices"] mutableCopy];[choices removeObjectForKey:identity];if(choices)[BBPreferences() setObject:choices forKey:@"MappedDevices"];};
-        if(NSThread.isMainThread)clearMapping();else dispatch_async(dispatch_get_main_queue(),clearMapping);
+- (void)updateControllerReadings:(NSArray<NSDictionary*>*)readings {
+    [_lock lock];
+    if(![_controllerReadings isEqualToArray:readings]){
+        _controllerReadings=[readings copy];
+        _urgent=YES;
     }
+    [_lock unlock];
 }
+- (void)refreshIdentity:(NSString*)identity {if(!identity.length)return;[_lock lock];[_refreshTargets addObject:identity];_urgent=YES;[_lock unlock];}
 - (void)remember:(NSString*)identity physical:(NSString*)physical name:(NSString*)name category:(NSString*)category {
     if([category isEqual:@"Unknown"])return;
     _known[identity]=@{@"identity":identity,@"physical":physical,@"name":name,@"category":category};
@@ -353,9 +405,9 @@ static BOOL mappingEnabled(NSString *identity){return [[BBPreferences() dictiona
 }
 - (void)reconcile:(NSSet*)present interval:(NSTimeInterval)interval {
     NSTimeInterval now=NSDate.date.timeIntervalSince1970;
-    for(NSString*k in [_sources.allKeys copy]){NSDictionary*info=_known[k],*sample=_samples[k];if(!mappingEnabled(k)||![present containsObject:info[@"physical"]]||!BBReadingFresh([sample[@"updated"] doubleValue],now,interval))[_sources removeObjectForKey:k];}
+    for(NSString*k in [_sources.allKeys copy]){NSDictionary*info=_known[k],*sample=_samples[k];if(!mappingEnabled(k,info[@"category"])||![present containsObject:info[@"physical"]]||!BBReadingFresh([sample[@"updated"] doubleValue],now,interval))[_sources removeObjectForKey:k];}
     for(NSString*k in _known){
-        NSDictionary*info=_known[k],*sample=_samples[k];if(!mappingEnabled(k)||![present containsObject:info[@"physical"]]||!BBReadingFresh([sample[@"updated"] doubleValue],now,interval))continue;
+        NSDictionary*info=_known[k],*sample=_samples[k];if(!mappingEnabled(k,info[@"category"])||![present containsObject:info[@"physical"]]||!BBReadingFresh([sample[@"updated"] doubleValue],now,interval))continue;
         BBSource*s=_sources[k];if(s&&s.updated.timeIntervalSince1970>=[sample[@"updated"] doubleValue])continue;
         s=s?:[BBSource new];s.physical=info[@"physical"];
         if([s publish:k name:info[@"name"] category:info[@"category"] reading:sample[@"reading"]])_sources[k]=s;else _errors[info[@"physical"]]=@"电量已读取，系统电源发布失败";
@@ -366,7 +418,17 @@ static BOOL mappingEnabled(NSString *identity){return [[BBPreferences() dictiona
     IOHIDManagerRef manager=IOHIDManagerCreate(kCFAllocatorDefault,0);IOHIDManagerSetDeviceMatching(manager,NULL);
     NSSet*devices=CFBridgingRelease(IOHIDManagerCopyDevices(manager));NSMutableSet*present=[NSMutableSet new];NSMutableArray*rows=[NSMutableArray new];NSMutableSet*seen=[NSMutableSet new];
     for(id obj in devices){NSDictionary*p=property((__bridge IOHIDDeviceRef)obj);if(receiverKind(p)!=BBReceiverNone)[present addObject:physicalID(p)];}
-    [self applyDeletions:present];
+    [_lock lock];NSArray *controllers=_controllerReadings;[_lock unlock];
+    for(NSDictionary *controller in controllers){
+        NSString *physical=controller[@"physical"];
+        if(!physical)continue;
+        [present addObject:physical];
+        NSString *identity=logicalID(physical,0);
+        [self remember:identity physical:physical name:controller[@"name"] category:@"Game Controller"];
+        NSDictionary *reading=controller[@"reading"];
+        if(reading)[self storeReading:reading physical:physical slot:0 name:controller[@"name"] category:@"Game Controller"];
+        else [_samples removeObjectForKey:identity];
+    }
     NSTimeInterval interval=BBInterval([BBPreferences() objectForKey:@"ReportInterval"]);
     IOHIDAccessType access=IOHIDCheckAccess(kIOHIDRequestTypeListenEvent);
     [_lock lock];BOOL forced=_forcePoll;_forcePoll=NO;NSSet*targets=[_refreshTargets copy];[_refreshTargets removeAllObjects];[_lock unlock];forced=forced||(access==kIOHIDAccessTypeGranted&&_lastAccess!=access);_lastAccess=access;
@@ -374,10 +436,13 @@ static BOOL mappingEnabled(NSString *identity){return [[BBPreferences() dictiona
     // Losing a receiver invalidates its cache immediately, even if it is reinserted before the next period.
     for(NSString*k in [_samples.allKeys copy])if(![present containsObject:_known[k][@"physical"]])[_samples removeObjectForKey:k];
     for(NSString*k in [_listeners.allKeys copy])if(![present containsObject:k])[_listeners removeObjectForKey:k];
+    [_offlineReceivers intersectSet:present];
     _previousPresent=[present copy];NSTimeInterval queryStarted=NSDate.date.timeIntervalSince1970;
     BOOL due=BBQueryDue(_lastQuery,queryStarted,interval,forced,newReceivers.count>0);
     if(due)_lastQuery=queryStarted;
-    [self reconcile:present interval:interval];
+    NSMutableSet *connected=[present mutableCopy];
+    [connected minusSet:_offlineReceivers];
+    [self reconcile:connected interval:interval];
     for(id obj in devices){
         IOHIDDeviceRef dev=(__bridge IOHIDDeviceRef)obj;NSDictionary*p=property(dev);if(![p[@"Transport"] isEqual:@"USB"])continue;
         BBReceiverKind kind=receiverKind(p);
@@ -465,7 +530,10 @@ static BOOL mappingEnabled(NSString *identity){return [[BBPreferences() dictiona
                 }
             }else for(int attempt=0;attempt<3&&!reading;attempt++){
                 if(kind==BBReceiverCompx){
-                    reading=BBCompxBattery(c);
+                    NSNumber *online=nil;
+                    reading=BBCompxBattery(c,&online);
+                    if(online.boolValue)[_offlineReceivers removeObject:physical];
+                    else if(online)[_offlineReceivers addObject:physical];
                     if(!reading)break; // Never use a receiver's cached percentage while offline.
                 }else if(kind==BBReceiverMchose){
                     uint8_t rid=[profile[@"reportID"] intValue];
@@ -515,15 +583,20 @@ static BOOL mappingEnabled(NSString *identity){return [[BBPreferences() dictiona
         }
     }
     // Querying can take seconds. Reconcile a second time to honour selection changes made during a query.
-    [self reconcile:present interval:interval];
+    connected=[present mutableCopy];
+    [connected minusSet:_offlineReceivers];
+    [self reconcile:connected interval:interval];
     if(!self.diagnostic)[BBPreferences() setObject:_known forKey:@"KnownDevices"];
     NSTimeInterval now=NSDate.date.timeIntervalSince1970;
     for(NSString*k in [[_known allKeys] sortedArrayUsingSelector:@selector(compare:)]){
-        NSDictionary*info=_known[k],*sample=_samples[k];NSString*physical=info[@"physical"];BOOL connected=[present containsObject:physical];BOOL selected=mappingEnabled(k);BOOL fresh=BBReadingFresh([sample[@"updated"] doubleValue],now,interval);BOOL published=_sources[k]!=nil;
-        NSString*state=!connected?@"接收器未连接":(published?@"已映射到系统电量":(fresh?(selected?@"等待系统接收":@"已读取，未选择映射"):(sample?@"上次电量已过期":@"等待有效电量")));
-        if(connected&&_errors[physical])state=[state stringByAppendingFormat:@"；%@",_errors[physical]];
-        NSMutableDictionary*row=[info mutableCopy];row[@"selectable"]=@YES;row[@"mapped"]=@(selected);row[@"connected"]=@(connected);row[@"status"]=state;row[@"published"]=@(published);
-        if(sample){row[@"updated"]=sample[@"updated"];row[@"percent"]=sample[@"reading"][@"percent"];row[@"fresh"]=@(fresh);row[@"charging"]=sample[@"reading"][@"charging"]?:@NO;row[@"full"]=sample[@"reading"][@"full"]?:@NO;}
+        NSDictionary*info=_known[k],*sample=_samples[k];NSString*physical=info[@"physical"];
+        if(![connected containsObject:physical])continue;
+        BOOL selected=mappingEnabled(k,info[@"category"]);BOOL fresh=BBReadingFresh([sample[@"updated"] doubleValue],now,interval);BOOL published=_sources[k]!=nil;
+        NSString*state=published?@"已映射到系统电量":(fresh?(selected?@"等待系统接收":@"已读取，未选择映射"):(sample?@"上次电量已过期":@"等待有效电量"));
+        if(_errors[physical])state=[state stringByAppendingFormat:@"；%@",_errors[physical]];
+        NSMutableDictionary*row=[info mutableCopy];row[@"selectable"]=@YES;row[@"mapped"]=@(selected);row[@"connected"]=@YES;row[@"status"]=state;row[@"published"]=@(published);
+        if(sample){row[@"updated"]=sample[@"updated"];row[@"percent"]=sample[@"reading"][@"percent"];row[@"fresh"]=@(fresh);row[@"charging"]=sample[@"reading"][@"charging"]?:(BBGameControllerCategory(info[@"category"])?nil:@NO);row[@"full"]=sample[@"reading"][@"full"]?:@NO;row[@"approximate"]=sample[@"reading"][@"approximate"];}
+        if(BBGameControllerCategory(info[@"category"]))row[@"transport"]=@"Bluetooth";
         [rows addObject:row];
     }
     NSMutableSet*unknown=[NSMutableSet new];
@@ -573,7 +646,6 @@ static void BBDrawDeviceSeparator(CGFloat width, CGFloat y) {
 @protocol BBMappingTarget <NSObject>
 - (void)setDeviceMapping:(NSMenuItem*)sender;
 - (void)refreshDevice:(NSMenuItem*)sender;
-- (void)deleteDevice:(NSMenuItem*)sender;
 - (void)permission:(id)sender;
 @end
 @interface BBDeviceRow:NSView
@@ -581,7 +653,6 @@ static void BBDrawDeviceSeparator(CGFloat width, CGFloat y) {
 @property(weak) id<BBMappingTarget> menuTarget;
 @property NSSwitch*mappingSwitch;
 @property NSButton*refreshButton;
-@property NSButton*deleteButton;
 @property BOOL showsSeparator;
 - (instancetype)initWithFrame:(NSRect)frame record:(NSDictionary*)r;
 @end
@@ -785,31 +856,31 @@ static NSAttributedString *BBDriveMetric(NSString *name, NSString *value, CGFloa
         BOOL connected=[r[@"connected"] boolValue];BOOL needsPermission=[r[@"status"] containsString:@"访问被拒绝"];BOOL fresh=[r[@"fresh"] boolValue];NSTimeInterval updated=[r[@"updated"] doubleValue];
         CGFloat w=frame.size.width;
         BOOL supported=[r[@"selectable"] boolValue]&&[r[@"identity"] length]>0;
-        NSString*symbol=[r[@"category"] isEqual:@"Keyboard"]?@"keyboard":([r[@"category"] isEqual:@"Mouse"]?@"computermouse":@"cable.connector");
+        BOOL controller=BBGameControllerCategory(r[@"category"]);
+        NSString*symbol=controller?@"gamecontroller":([r[@"category"] isEqual:@"Keyboard"]?@"keyboard":([r[@"category"] isEqual:@"Mouse"]?@"computermouse":@"cable.connector"));
         CGFloat iconSize=40;
         NSImageView*icon=[[NSImageView alloc]initWithFrame:NSMakeRect(16,NSMidY(self.bounds)-iconSize/2,iconSize,iconSize)];icon.imageAlignment=NSImageAlignCenter;icon.autoresizingMask=NSViewMinYMargin|NSViewMaxYMargin;icon.image=[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:r[@"category"]];icon.symbolConfiguration=[NSImageSymbolConfiguration configurationWithPointSize:28 weight:NSFontWeightRegular];icon.contentTintColor=connected?NSColor.secondaryLabelColor:NSColor.tertiaryLabelColor;[self addSubview:icon];
-        NSTextField*name=cardLabel(r[@"name"]?:@"USB 设备",NSMakeRect(72,56,w-368,20),[NSFont systemFontOfSize:13 weight:NSFontWeightMedium],NSColor.labelColor);name.toolTip=r[@"name"];[self addSubview:name];
-        NSString*connection=!connected?@"未连接":(needsPermission?@"需要输入监控授权":(fresh?@"已连接":@"接收器在线 · 等待电量"));
+        NSTextField*name=cardLabel(r[@"name"]?:@"USB 设备",NSMakeRect(72,56,w-330,20),[NSFont systemFontOfSize:13 weight:NSFontWeightMedium],NSColor.labelColor);name.toolTip=r[@"name"];[self addSubview:name];
+        NSString*connection=@"未连接";
+        if(connected){
+            if(needsPermission)connection=@"需要输入监控授权";
+            else if(controller&&fresh)connection=@"蓝牙已连接";
+            else if(controller)connection=@"蓝牙已连接 · 等待电量";
+            else connection=fresh?@"已连接":@"接收器在线 · 等待电量";
+        }
         NSColor*stateColor=connected&&needsPermission?NSColor.systemOrangeColor:NSColor.secondaryLabelColor;
 
         NSString*time=@"尚未读取";if(updated>0){NSString*clock=[NSDateFormatter localizedStringFromDate:[NSDate dateWithTimeIntervalSince1970:updated] dateStyle:NSDateFormatterNoStyle timeStyle:NSDateFormatterShortStyle];time=[NSString stringWithFormat:@"%@%@",connected&&fresh?@"更新于 ":@"上次读取 ",clock];}
-        NSTextField *status=cardLabel(@"",NSMakeRect(72,35,w-368,17),[NSFont systemFontOfSize:11],stateColor);
+        NSTextField *status=cardLabel(@"",NSMakeRect(72,35,w-330,17),[NSFont systemFontOfSize:11],stateColor);
         NSMutableAttributedString *statusText=[[NSMutableAttributedString alloc]initWithString:connection attributes:@{NSFontAttributeName:status.font,NSForegroundColorAttributeName:stateColor}];
         [statusText appendAttributedString:[[NSAttributedString alloc]initWithString:[@"  " stringByAppendingString:time] attributes:@{NSFontAttributeName:[NSFont systemFontOfSize:10],NSForegroundColorAttributeName:NSColor.tertiaryLabelColor}]];
         status.attributedStringValue=statusText;status.toolTip=[NSString stringWithFormat:@"%@  %@",connection,time];[self addSubview:status];
         NSString*percent=(connected&&fresh&&r[@"percent"])?[NSString stringWithFormat:@"%@%%",r[@"percent"]]:@"—";
-        NSTextField*battery=cardLabel(percent,NSMakeRect(w-286,48,80,26),[NSFont monospacedDigitSystemFontOfSize:20 weight:NSFontWeightRegular],connected?NSColor.labelColor:NSColor.secondaryLabelColor);battery.alignment=NSTextAlignmentRight;[self addSubview:battery];
-        NSTextField*charge=cardLabel(BBChargeStatus(r),NSMakeRect(w-306,27,100,16),[NSFont systemFontOfSize:10],connected&&fresh&&[r[@"charging"] boolValue]?NSColor.systemGreenColor:NSColor.secondaryLabelColor);charge.alignment=NSTextAlignmentRight;charge.accessibilityIdentifier=@"DeviceChargingStatus";[self addSubview:charge];
-        NSTextField*mapLabel=cardLabel(@"映射",NSMakeRect(w-154,60,64,15),[NSFont systemFontOfSize:10],NSColor.secondaryLabelColor);mapLabel.alignment=NSTextAlignmentCenter;[self addSubview:mapLabel];
-        self.mappingSwitch=[[NSSwitch alloc]initWithFrame:NSMakeRect(w-144,29,44,24)];_mappingSwitch.controlSize=NSControlSizeSmall;_mappingSwitch.target=self;_mappingSwitch.action=@selector(mappingChanged:);_mappingSwitch.state=mappingEnabled(r[@"identity"]?:@"")?NSControlStateValueOn:NSControlStateValueOff;_mappingSwitch.enabled=supported;_mappingSwitch.accessibilityLabel=[NSString stringWithFormat:@"%@的电量映射到mac系统",r[@"name"]?:@"设备"];[self addSubview:_mappingSwitch];
-        self.refreshButton=[NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:needsPermission?@"lock.open":@"arrow.clockwise" accessibilityDescription:needsPermission?@"授权读取":@"刷新此设备"] target:self action:@selector(performDeviceAction:)];_refreshButton.frame=NSMakeRect(w-88,33,30,28);_refreshButton.bezelStyle=NSBezelStyleRounded;_refreshButton.enabled=connected&&(supported||needsPermission);_refreshButton.toolTip=needsPermission?@"授权读取此设备电量":@"刷新此设备电量";_refreshButton.accessibilityIdentifier=@"DeviceRefresh";[self addSubview:_refreshButton];
-        self.deleteButton=[NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"trash" accessibilityDescription:@"删除设备"] target:self action:@selector(deleteDeviceRecord:)];
-        _deleteButton.frame=NSMakeRect(w-50,33,30,28);
-        _deleteButton.bezelStyle=NSBezelStyleRounded;
-        _deleteButton.enabled=!connected&&[r[@"identity"] length]>0;
-        _deleteButton.toolTip=@"删除设备";
-        _deleteButton.accessibilityIdentifier=@"DeviceDelete";
-        [self addSubview:_deleteButton];
+        NSTextField*battery=cardLabel(percent,NSMakeRect(w-248,48,80,26),[NSFont monospacedDigitSystemFontOfSize:20 weight:NSFontWeightRegular],connected?NSColor.labelColor:NSColor.secondaryLabelColor);battery.alignment=NSTextAlignmentRight;[self addSubview:battery];
+        NSTextField*charge=cardLabel(BBChargeStatus(r),NSMakeRect(w-268,27,100,16),[NSFont systemFontOfSize:10],connected&&fresh&&[r[@"charging"] boolValue]?NSColor.systemGreenColor:NSColor.secondaryLabelColor);charge.alignment=NSTextAlignmentRight;charge.accessibilityIdentifier=@"DeviceChargingStatus";[self addSubview:charge];
+        NSTextField*mapLabel=cardLabel(@"映射",NSMakeRect(w-116,60,64,15),[NSFont systemFontOfSize:10],NSColor.secondaryLabelColor);mapLabel.alignment=NSTextAlignmentCenter;[self addSubview:mapLabel];
+        self.mappingSwitch=[[NSSwitch alloc]initWithFrame:NSMakeRect(w-106,29,44,24)];_mappingSwitch.controlSize=NSControlSizeSmall;_mappingSwitch.target=self;_mappingSwitch.action=@selector(mappingChanged:);_mappingSwitch.state=supported&&mappingEnabled(r[@"identity"],r[@"category"])?NSControlStateValueOn:NSControlStateValueOff;_mappingSwitch.enabled=supported;_mappingSwitch.accessibilityLabel=[NSString stringWithFormat:@"%@的电量映射到mac系统",r[@"name"]?:@"设备"];[self addSubview:_mappingSwitch];
+        self.refreshButton=[NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:needsPermission?@"lock.open":@"arrow.clockwise" accessibilityDescription:needsPermission?@"授权读取":@"刷新此设备"] target:self action:@selector(performDeviceAction:)];_refreshButton.frame=NSMakeRect(w-50,33,30,28);_refreshButton.bezelStyle=NSBezelStyleRounded;_refreshButton.enabled=connected&&(supported||needsPermission);_refreshButton.toolTip=needsPermission?@"授权读取此设备电量":@"刷新此设备电量";_refreshButton.accessibilityIdentifier=@"DeviceRefresh";[self addSubview:_refreshButton];
         self.toolTip=r[@"status"];
     }return self;
 }
@@ -822,23 +893,6 @@ static NSAttributedString *BBDriveMetric(NSString *name, NSString *value, CGFloa
 - (void)mappingChanged:(NSSwitch*)sender {
     NSMenuItem*item=[NSMenuItem new];item.representedObject=@{@"identity":_record[@"identity"]?:@"",@"enabled":@(sender.state==NSControlStateValueOn)};
     [_menuTarget setDeviceMapping:item];
-}
-- (void)deleteDeviceRecord:(id)sender {
-    if(!_deleteButton.enabled)return;
-    NSMenuItem*item=[NSMenuItem new];
-    item.representedObject=_record[@"identity"];
-    [_menuTarget deleteDevice:item];
-}
-- (NSMenu*)menuForEvent:(NSEvent*)event {
-    NSString*identity=_record[@"identity"];
-    id<BBMappingTarget> target=_menuTarget;
-    if(!_deleteButton.enabled||!target)return nil;
-
-    NSMenu*menu=[NSMenu new];
-    NSMenuItem*item=[menu addItemWithTitle:@"删除设备" action:@selector(deleteDevice:) keyEquivalent:@""];
-    item.target=target;
-    item.representedObject=identity;
-    return menu;
 }
 - (void)drawRect:(NSRect)dirty {
     if(_showsSeparator) BBDrawDeviceSeparator(self.bounds.size.width,0);
@@ -1085,6 +1139,11 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     [self createStatusItem];
     self.engine=[BBEngine new];self.thread=[[NSThread alloc]initWithTarget:_engine selector:@selector(run) object:nil];self.thread.name=@"DeviceBridge HID";[_thread start];
     if(!BBTestingUI){
+        GCController.shouldMonitorBackgroundEvents=YES;
+        for(NSString *notification in @[GCControllerDidConnectNotification,GCControllerDidDisconnectNotification]){
+            [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(controllerConnectionChanged:) name:notification object:nil];
+        }
+        [_engine updateControllerReadings:BBControllerReadings()];
         self.displays=[BBDisplayController new];[_displays start];
         self.usbSmart=[DBUSBSmart new];
         __weak BBApp *weak=self;
@@ -1134,7 +1193,10 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     NSMenuItem*quit=[self menuItem:@"退出程序" action:@selector(quit:) value:nil];quit.keyEquivalent=@"q";[menu addItem:quit];
 }
 - (void)toggleMapping:(NSMenuItem*)sender {
-    NSString*identity=sender.representedObject;if(!identity)return;NSMutableDictionary*choices=[[BBPreferences() dictionaryForKey:@"MappedDevices"] mutableCopy]?:[NSMutableDictionary new];choices[identity]=@(![choices[identity] boolValue]);[BBPreferences() setObject:choices forKey:@"MappedDevices"];[_engine settingsChanged];
+    NSString*identity=sender.representedObject;if(!identity)return;
+    NSString *category=nil;
+    for(NSDictionary *row in [_engine status])if([row[@"identity"] isEqual:identity]){category=row[@"category"];break;}
+    NSMutableDictionary*choices=[[BBPreferences() dictionaryForKey:@"MappedDevices"] mutableCopy]?:[NSMutableDictionary new];choices[identity]=@(!mappingEnabled(identity,category));[BBPreferences() setObject:choices forKey:@"MappedDevices"];[_engine settingsChanged];
 }
 - (void)setDeviceMapping:(NSMenuItem*)sender {
     NSDictionary*value=sender.representedObject;NSString*identity=value[@"identity"];if(!identity.length)return;
@@ -1148,26 +1210,8 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
 - (void)showDeviceInfo:(NSMenuItem*)sender {
     NSDictionary*r=sender.representedObject;NSAlert*a=[NSAlert new];a.messageText=r[@"name"]?:@"设备信息";
     NSString*updated=r[@"updated"]?[NSDateFormatter localizedStringFromDate:[NSDate dateWithTimeIntervalSince1970:[r[@"updated"] doubleValue]] dateStyle:NSDateFormatterShortStyle timeStyle:NSDateFormatterShortStyle]:@"尚未读取";
-    a.informativeText=[NSString stringWithFormat:@"类型：%@\n连接：%@\n电量：%@\n充电状态：%@\n更新：%@\n系统映射：%@\n\n%@",[r[@"category"] isEqual:@"Keyboard"]?@"键盘":([r[@"category"] isEqual:@"Mouse"]?@"鼠标":@"USB 设备"),[r[@"connected"] boolValue]?@"接收器在线":@"未连接",r[@"percent"]?[NSString stringWithFormat:@"%@%%%@",r[@"percent"],[r[@"fresh"] boolValue]?@"":@"（上次读数）"]:@"未获取",BBChargeStatus(r),updated,mappingEnabled(r[@"identity"]?:@"")?@"开启":@"关闭",r[@"status"]?:@""];
+    a.informativeText=[NSString stringWithFormat:@"类型：%@\n连接：%@\n电量：%@\n充电状态：%@\n更新：%@\n系统映射：%@\n\n%@",[r[@"category"] isEqual:@"Keyboard"]?@"键盘":([r[@"category"] isEqual:@"Mouse"]?@"鼠标":@"USB 设备"),[r[@"connected"] boolValue]?@"接收器在线":@"未连接",r[@"percent"]?[NSString stringWithFormat:@"%@%%%@",r[@"percent"],[r[@"fresh"] boolValue]?@"":@"（上次读数）"]:@"未获取",BBChargeStatus(r),updated,mappingEnabled(r[@"identity"]?:@"",r[@"category"])?@"开启":@"关闭",r[@"status"]?:@""];
     [NSApp activateIgnoringOtherApps:YES];[a runModal];
-}
-- (void)deleteDevice:(NSMenuItem*)sender {
-    if (!_window || _window.attachedSheet) return;
-    NSString *identity = sender.representedObject;
-    for (NSDictionary *record in [_engine status]) {
-        if (![record[@"identity"] isEqual:identity] || [record[@"connected"] boolValue]) continue;
-        NSAlert *alert = [NSAlert new];
-        alert.alertStyle = NSAlertStyleWarning;
-        alert.messageText = [NSString stringWithFormat:@"删除「%@」？", record[@"name"] ?: @"设备"];
-        alert.informativeText = @"此设备的记录和电量映射设置将从 DeviceBridge 中移除。";
-        [alert addButtonWithTitle:@"取消"].keyEquivalent = @"\r";
-        NSButton *deleteButton = [alert addButtonWithTitle:@"删除"];
-        deleteButton.hasDestructiveAction = YES;
-        [alert beginSheetModalForWindow:_window completionHandler:^(NSModalResponse response) {
-            if (response == NSAlertSecondButtonReturn) [self.engine forgetIdentity:identity];
-        }];
-        return;
-    }
 }
 - (void)pickInterval:(NSPopUpButton*)sender {[self changeInterval:sender.selectedItem];}
 - (void)changeInterval:(NSMenuItem*)sender {[BBPreferences() setObject:@(BBInterval(sender.representedObject)) forKey:@"ReportInterval"];[_engine kick];[self refresh];}
@@ -1203,7 +1247,7 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     NSButton *refresh=button(@"刷新全部",self,@selector(rescan:),NSMakeRect(594,24,102,32));refresh.image=[NSImage imageWithSystemSymbolName:@"arrow.clockwise" accessibilityDescription:@"刷新全部设备"];refresh.imagePosition=NSImageLeading;refresh.bezelStyle=NSBezelStyleRounded;refresh.autoresizingMask=NSViewMinXMargin;[_devicesView addSubview:refresh];
     self.authorizeButton=button(@"授权读取…",self,@selector(permission:),NSMakeRect(584,64,112,28));_authorizeButton.hidden=YES;_authorizeButton.autoresizingMask=NSViewMinXMargin;[_devicesView addSubview:_authorizeButton];
     self.displayHeading=cardLabel(@"显示器",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
-    self.wirelessHeading=cardLabel(@"2.4G 设备",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
+    self.wirelessHeading=cardLabel(@"无线设备",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
     self.generalHeading=cardLabel(@"通用",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
     for(NSTextField *heading in @[_displayHeading,_wirelessHeading,_generalHeading])[_devicesView addSubview:heading];
     self.displayGroup=[[BBFlippedView alloc]initWithFrame:NSZeroRect];self.wirelessGroup=[[BBFlippedView alloc]initWithFrame:NSZeroRect];
@@ -1232,10 +1276,21 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     [self buildWindow];
     [_window makeKeyAndOrderFront:nil];[self refresh];[NSApp activateIgnoringOtherApps:YES];
 }
+- (void)controllerConnectionChanged:(NSNotification*)notification {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self refresh];
+        [self.engine kick];
+    });
+}
 - (void)refresh {
+    if(!BBTestingUI)[_engine updateControllerReadings:BBControllerReadings()];
     NSTimeInterval interval=BBInterval([BBPreferences() objectForKey:@"ReportInterval"]);
     _statusItem.button.toolTip=[NSString stringWithFormat:@"%@ · 设备状态与显示器控制 · 每%@上报",BBApplicationTitle(),BBIntervalLabel(interval)];if(!_window)return;
-    NSArray*rows=[[_engine status] arrayByAddingObjectsFromArray:_displays.snapshot?:@[]];_heading.stringValue=@"自动更新";
+    NSPredicate *connectedDevices=[NSPredicate predicateWithFormat:@"connected == YES"];
+    NSArray *wirelessRows=[[_engine status] filteredArrayUsingPredicate:connectedDevices]?:@[];
+    NSArray *displayRows=[_displays.snapshot filteredArrayUsingPredicate:connectedDevices]?:@[];
+    NSArray *rows=[wirelessRows arrayByAddingObjectsFromArray:displayRows];
+    _heading.stringValue=@"自动更新";
     for(NSMenuItem*i in _intervalPicker.itemArray)if([i.representedObject doubleValue]==interval){[_intervalPicker selectItem:i];break;}
     _autoStartSwitch.state=[BBPreferences() boolForKey:@"AutoStartEnabled"]?NSControlStateValueOn:NSControlStateValueOff;
     _autoStartSwitch.toolTip=(!BBTestingUI&&SMAppService.mainAppService.status==SMAppServiceStatusRequiresApproval)?@"请在系统设置的登录项中批准自动启动":@"登录 macOS 时自动启动";
@@ -1246,7 +1301,10 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     for(NSView *view in _displayGroup.subviews){
         if ([view isKindOfClass:BBDisplayRow.class]) {
             BBDisplayRow *row = (BBDisplayRow *)view;
-            if (row.isTrackingBrightness || row.isEditingPercent) return;
+            if (row.isTrackingBrightness || row.isEditingPercent) {
+                for(NSDictionary *display in displayRows)
+                    if([display[@"identity"] isEqual:row.record[@"identity"]])return;
+            }
         }
     }
     NSTimeInterval now=NSDate.date.timeIntervalSince1970;
@@ -1256,7 +1314,6 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     NSPoint origin=_devicesScroll.contentView.bounds.origin;
     _devicesScroll.autohidesScrollers=NO;[_devicesScroll tile];
     CGFloat documentWidth=MAX(1,_devicesScroll.contentSize.width),width=MAX(1,documentWidth-48),y=100;
-    NSArray *displayRows=_displays.snapshot?:@[],*wirelessRows=[_engine status]?:@[];
     NSArray *groups=@[_displayGroup,_wirelessGroup],*headings=@[_displayHeading,_wirelessHeading],*sections=@[displayRows,wirelessRows];
     for(NSUInteger section=0;section<sections.count;section++){
         BBFlippedView *group=groups[section];NSTextField *heading=headings[section];NSArray *items=sections[section];
@@ -1264,7 +1321,7 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
         CGFloat groupHeight=items.count?items.count*96:64;
         group.frame=NSMakeRect(24,y,width,groupHeight);group.groupHeight=groupHeight;
         for(NSView *view in group.subviews.copy)[view removeFromSuperview];
-        if(!items.count)[group addSubview:cardLabel(section?@"未发现 2.4G 设备":@"暂无显示器",NSMakeRect(16,22,MAX(1,width-32),20),[NSFont systemFontOfSize:12],NSColor.secondaryLabelColor)];
+        if(!items.count)[group addSubview:cardLabel(section?@"未发现无线设备":@"暂无显示器",NSMakeRect(16,22,MAX(1,width-32),20),[NSFont systemFontOfSize:12],NSColor.secondaryLabelColor)];
         for(NSUInteger i=0;i<items.count;i++){
             NSRect frame=NSMakeRect(0,i*96,width,96);
             if(section==0){BBDisplayRow *row=[[BBDisplayRow alloc]initWithFrame:frame record:items[i]];row.controller=_displays;row.showsSeparator=i+1<items.count;[group addSubview:row];}
