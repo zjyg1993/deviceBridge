@@ -166,22 +166,39 @@ static BOOL DBMountVolume(NSString *uuid) {
     return NO;
 }
 
-typedef void (^DBEjectCompletion)(NSError *);
-
-static void DBEjectFinished(DADiskRef disk, DADissenterRef dissenter, void *context) {
-    DBEjectCompletion completion = CFBridgingRelease(context);
-    NSError *error = nil;
-    if (dissenter) {
-        NSString *reason = (__bridge NSString *)DADissenterGetStatusString(dissenter);
-        error = [NSError errorWithDomain:@"DeviceBridge.Disk" code:DADissenterGetStatus(dissenter)
-            userInfo:@{NSLocalizedDescriptionKey:reason.length ? reason : @"macOS 未能弹出硬盘，请关闭正在使用该盘的文件后重试。"}];
-    }
-    completion(error);
+static NSError *DBEjectTargetMissing(void) {
+    return [NSError errorWithDomain:@"DeviceBridge.Disk" code:kDAReturnNotFound
+        userInfo:@{NSLocalizedDescriptionKey:@"找不到可弹出的外置硬盘。"}];
 }
 
-static void DBUnmountForEject(DADiskRef disk, DADissenterRef dissenter, void *context) {
-    if (dissenter) DBEjectFinished(disk, dissenter, context);
-    else DADiskEject(disk, kDADiskEjectOptionDefault, DBEjectFinished, context);
+static NSError *DBEjectWholeDisk(NSString *bsdName, NSNumber *mediaID) {
+    // Recheck the registry identity before passing the reusable BSD name to diskutil.
+    io_service_t media = IOServiceGetMatchingService(kIOMainPortDefault,
+        IOBSDNameMatching(kIOMainPortDefault, 0, bsdName.UTF8String));
+    if (!media) return DBEjectTargetMissing();
+    uint64_t currentID = 0;
+    IORegistryEntryGetRegistryEntryID(media, &currentID);
+    IOObjectRelease(media);
+    if (!currentID || currentID != mediaID.unsignedLongLongValue) return DBEjectTargetMissing();
+
+    // Let macOS unmount the APFS volumes and eject the physical disk in one operation.
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/sbin/diskutil"];
+    task.arguments = @[@"eject", bsdName];
+    task.standardInput = NSFileHandle.fileHandleWithNullDevice;
+    NSPipe *output = [NSPipe pipe];
+    task.standardOutput = output;
+    task.standardError = output;
+    NSError *launchError = nil;
+    if (![task launchAndReturnError:&launchError]) return launchError;
+    NSData *data = [output.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+    if (task.terminationStatus == 0) return nil;
+
+    NSString *reason = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return [NSError errorWithDomain:@"DeviceBridge.Disk" code:task.terminationStatus
+        userInfo:@{NSLocalizedDescriptionKey:reason.length ? reason : @"macOS 未能弹出硬盘。"}];
 }
 
 @interface DBUSBSmart ()
@@ -264,33 +281,36 @@ static DADissenterRef DBApproveMount(DADiskRef disk, void *context) {
         ? DADiskCreateFromIOMedia(kCFAllocatorDefault, _session, media) : NULL;
     if (media) IOObjectRelease(media);
     NSDictionary *description = disk ? CFBridgingRelease(DADiskCopyDescription(disk)) : nil;
+    const char *name = disk ? DADiskGetBSDName(disk) : NULL;
+    NSString *bsdName = name ? [NSString stringWithUTF8String:name] : nil;
+    if (disk) CFRelease(disk);
     if (![description[(__bridge NSString *)kDADiskDescriptionMediaWholeKey] isEqual:@YES] ||
-        ![description[(__bridge NSString *)kDADiskDescriptionDeviceInternalKey] isEqual:@NO]) {
-        if (disk) CFRelease(disk);
+        ![description[(__bridge NSString *)kDADiskDescriptionDeviceInternalKey] isEqual:@NO] ||
+        ![bsdName rangeOfString:@"^disk[0-9]+$" options:NSRegularExpressionSearch].length) {
         [self refreshInventory];
-        completion([NSError errorWithDomain:@"DeviceBridge.Disk" code:kDAReturnNotFound
-            userInfo:@{NSLocalizedDescriptionKey:@"找不到可弹出的外置硬盘。"}]);
+        completion(DBEjectTargetMissing());
         return;
     }
 
     _ejectingID = mediaID;
     if (self.changed) self.changed();
-    DBEjectCompletion finished = ^(NSError *error) {
-        self->_ejectingID = nil;
-        if (!error) {
-            self->_inventoryGeneration++;
-            NSArray *drives = self->_builtInAndExternalDrives;
-            self->_builtInAndExternalDrives = [drives filteredArrayUsingPredicate:
-                [NSPredicate predicateWithBlock:^BOOL(NSDictionary *drive, NSDictionary *bindings) {
-                    return ![drive[@"ejectID"] isEqual:mediaID];
-                }]];
-        }
-        [self refreshInventory];
-        if (self.changed) self.changed();
-        completion(error);
-    };
-    DADiskUnmount(disk, kDADiskUnmountOptionWhole, DBUnmountForEject, (__bridge_retained void *)[finished copy]);
-    CFRelease(disk);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = DBEjectWholeDisk(bsdName, mediaID);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_ejectingID = nil;
+            if (!error) {
+                self->_inventoryGeneration++;
+                NSArray *drives = self->_builtInAndExternalDrives;
+                self->_builtInAndExternalDrives = [drives filteredArrayUsingPredicate:
+                    [NSPredicate predicateWithBlock:^BOOL(NSDictionary *drive, NSDictionary *bindings) {
+                        return ![drive[@"ejectID"] isEqual:mediaID];
+                    }]];
+            }
+            [self refreshInventory];
+            if (self.changed) self.changed();
+            completion(error);
+        });
+    });
 }
 
 - (NSArray<NSDictionary *> *)drives {

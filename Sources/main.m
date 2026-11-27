@@ -1110,6 +1110,19 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     icon.template=YES;icon.size=NSMakeSize(19,19);_statusItem.button.image=icon;_statusItem.button.toolTip=[BBApplicationTitle() stringByAppendingString:@" · 设备状态与显示器控制"];
     self.statusMenu=[[NSMenu alloc]initWithTitle:@"DeviceBridge"];_statusMenu.delegate=self;_statusMenu.autoenablesItems=NO;_statusItem.menu=_statusMenu;
 }
+- (void)createMainMenu {
+    NSMenu *mainMenu = [NSMenu new];
+    NSMenuItem *applicationItem = [mainMenu addItemWithTitle:@"DeviceBridge" action:NULL keyEquivalent:@""];
+    applicationItem.submenu = [[NSMenu alloc] initWithTitle:@"DeviceBridge"];
+    NSMenuItem *quit = [applicationItem.submenu addItemWithTitle:@"退出 DeviceBridge" action:@selector(quit:) keyEquivalent:@"q"];
+    quit.target = self;
+
+    NSMenuItem *fileItem = [mainMenu addItemWithTitle:@"文件" action:NULL keyEquivalent:@""];
+    fileItem.submenu = [[NSMenu alloc] initWithTitle:@"文件"];
+    NSMenuItem *close = [fileItem.submenu addItemWithTitle:@"关闭窗口" action:@selector(performClose:) keyEquivalent:@"w"];
+    close.target = _window;
+    NSApp.mainMenu = mainMenu;
+}
 - (NSMenuItem*)menuItem:(NSString*)title action:(SEL)action value:(id)value {
     NSMenuItem*i=[[NSMenuItem alloc]initWithTitle:title action:action keyEquivalent:@""];i.target=self;i.representedObject=value;i.enabled=action!=NULL;return i;
 }
@@ -1182,6 +1195,7 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     if(_window)return;
     self.window=[[NSWindow alloc]initWithContentRect:NSMakeRect(0,0,720,700) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];
     _window.releasedWhenClosed=NO;_window.title=BBApplicationTitle();_window.backgroundColor=NSColor.windowBackgroundColor;[_window center];_window.contentMinSize=NSMakeSize(560,420);_window.delegate=self;
+    [self createMainMenu];
     NSView *content=_window.contentView;
     self.devicesScroll=[[NSScrollView alloc]initWithFrame:content.bounds];_devicesScroll.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;_devicesScroll.hasHorizontalScroller=NO;_devicesScroll.hasVerticalScroller=YES;_devicesScroll.autohidesScrollers=NO;_devicesScroll.drawsBackground=NO;_devicesScroll.borderType=NSNoBorder;
     self.devicesView=[[BBFlippedView alloc]initWithFrame:content.bounds];_devicesScroll.documentView=_devicesView;[content addSubview:_devicesScroll];

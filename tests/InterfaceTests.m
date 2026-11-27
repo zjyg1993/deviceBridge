@@ -3,6 +3,17 @@
 #import "../Sources/main.m"
 #undef main
 static void ensure(BOOL ok,const char*message){if(!ok){fprintf(stderr,"FAIL: %s\n",message);exit(1);}}
+@interface BBShortcutTestApp : BBApp
+@property BOOL quitRequested;
+@end
+@implementation BBShortcutTestApp
+- (void)quit:(id)sender {self.quitRequested=YES;}
+@end
+
+static NSEvent *commandKey(NSString *key, unsigned short keyCode, NSWindow *window) {
+    return [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:NSEventModifierFlagCommand timestamp:0 windowNumber:window.windowNumber context:nil characters:key charactersIgnoringModifiers:key isARepeat:NO keyCode:keyCode];
+}
+
 @interface BBFakeCompxChannel:BBChannel
 @property BOOL online;
 @property NSMutableArray*commands;
@@ -197,7 +208,7 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     [omniKeyboard removeObjectForKey:@"LocationID"];ensure(!BBASUSKeyboardInterfaceMatches(omniKeyboard,@"0b05:1ace:0"),"missing location never groups unrelated OMNI devices");
     NSTimeInterval now=NSDate.date.timeIntervalSince1970;
     NSArray*fixtures=@[@{@"name":@"G304 X LIGHTSPEED",@"identity":@"test.mouse",@"category":@"Mouse",@"connected":@YES,@"fresh":@YES,@"percent":@94,@"charging":@NO,@"full":@NO,@"updated":@(now),@"mapped":@YES,@"published":@YES,@"status":@"已映射到系统电量",@"selectable":@YES},@{@"name":@"MCHOSE K87 V3",@"identity":@"test.keyboard",@"category":@"Keyboard",@"connected":@YES,@"fresh":@YES,@"percent":@92,@"charging":@NO,@"full":@NO,@"updated":@(now),@"mapped":@YES,@"published":@YES,@"status":@"已映射到系统电量",@"selectable":@YES}];
-    BBApp*app=[BBApp new];app.engine=[BBEngine new];app.engine.snapshot=fixtures;app.statusMenu=[NSMenu new];app.statusMenu.autoenablesItems=NO;[app menuNeedsUpdate:app.statusMenu];
+    BBShortcutTestApp*app=[BBShortcutTestApp new];app.engine=[BBEngine new];app.engine.snapshot=fixtures;app.statusMenu=[NSMenu new];app.statusMenu.autoenablesItems=NO;[app menuNeedsUpdate:app.statusMenu];
     ensure(app.statusMenu.numberOfItems==2,"status menu contains only the two application commands");
     ensure([[app.statusMenu itemAtIndex:app.statusMenu.numberOfItems-2].title isEqual:@"显示主界面"]&&[app.statusMenu itemAtIndex:app.statusMenu.numberOfItems-2].action==@selector(showSettings:),"first command opens main window");
     ensure([[app.statusMenu itemAtIndex:app.statusMenu.numberOfItems-1].title isEqual:@"退出程序"]&&[app.statusMenu itemAtIndex:app.statusMenu.numberOfItems-1].action==@selector(quit:)&&[[app.statusMenu itemAtIndex:app.statusMenu.numberOfItems-1].keyEquivalent isEqual:@"q"],"second command quits with keyboard shortcut");
@@ -272,8 +283,11 @@ int main(int argc,const char*argv[]){@autoreleasepool{
     app.autoStartSwitch.state=NSControlStateValueOn;[app toggleAutoStart:app.autoStartSwitch];ensure([BBPreferences() boolForKey:@"AutoStartEnabled"],"main window startup switch persists enabled state");
     app.autoStartSwitch.state=NSControlStateValueOff;[app toggleAutoStart:app.autoStartSwitch];ensure(![BBPreferences() boolForKey:@"AutoStartEnabled"],"main window startup switch persists disabled state");
     [app showWindow];[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];ensure(app.window.visible,"opening main window displays it");
-    [app.window performClose:nil];[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];ensure(!app.window.visible,"closing main window hides it");
-    [app showWindow];[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];ensure(app.window.visible,"main window can reopen after close");[app.window orderOut:nil];
+    ensure([NSApp.mainMenu performKeyEquivalent:commandKey(@"w",13,app.window)],"Command-W dispatches from the main menu");
+    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];ensure(!app.window.visible&&!app.quitRequested,"Command-W closes the window and keeps the app running");
+    [app showWindow];[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];ensure(app.window.visible,"main window can reopen after close");
+    ensure([NSApp.mainMenu performKeyEquivalent:commandKey(@"q",12,app.window)]&&app.quitRequested,"Command-Q dispatches the app's quit action");
+    [app.window orderOut:nil];
     ensure([app.window.title containsString:Version],"window title exposes the running version");
     BBPermissionDisplayController *permissionDisplays=[BBPermissionDisplayController new];app.displays=permissionDisplays;
     NSDictionary*displayFixture=@{@"identity":@"display:test",@"category":@"Display",@"connected":@YES,@"mappingEnabled":@YES,@"brightnessBridgeEnabled":@YES,@"brightnessBridgeAvailable":@YES,@"volumeBridgeEnabled":@YES,@"audioOutputUID":@"test-hdmi",@"updated":@(now),@"name":@"DELL S2725QS",@"brightness":@{@"percent":@55},@"volume":@{@"percent":@20},@"status":@"DDC 已读取"};
