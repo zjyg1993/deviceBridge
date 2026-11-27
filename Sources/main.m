@@ -11,10 +11,11 @@
 #import "Display.h"
 #import "NativeAudioSetup.h"
 #import "DisplayDDC.h"
+#import "USBSmart.h"
 
 // Retained across the DeviceBridge rename for preferences, login items and permissions.
 static NSString *const BundleID=@"local.batterybridge.agent";
-static NSString *const Version=@"0.9.9-preview";
+static NSString *const Version=@"0.1.15-preview";
 static NSString *BBApplicationTitle(void){return [NSString stringWithFormat:@"DeviceBridge %@",Version];}
 static NSString *const InstallPath=@"/Applications/DeviceBridge.app";
 
@@ -585,6 +586,198 @@ static void BBDrawDeviceSeparator(CGFloat width, CGFloat y) {
 - (instancetype)initWithFrame:(NSRect)frame record:(NSDictionary*)r;
 @end
 static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*color){NSTextField*l=[NSTextField labelWithString:text];l.frame=frame;l.font=font;l.textColor=color;l.lineBreakMode=NSLineBreakByTruncatingTail;l.maximumNumberOfLines=1;return l;}
+@interface BBDriveRow:NSView
+@property BOOL showsSeparator;
+@property(copy) void (^ejectAction)(NSNumber *mediaID);
+@property NSNumber *ejectID;
+- (instancetype)initWithFrame:(NSRect)frame record:(NSDictionary*)drive;
+@end
+
+static NSNumber *driveNumber(NSDictionary *record, NSString *key) {
+    id value=record[key];
+    return [value isKindOfClass:NSNumber.class]?value:nil;
+}
+static NSString *driveBytes(NSNumber *value) {
+    return value?[NSByteCountFormatter stringFromByteCount:value.longLongValue countStyle:NSByteCountFormatterCountStyleDecimal]:nil;
+}
+
+static const CGFloat BBDriveRowHeight=128;
+
+@interface BBDriveProgress : NSView
+@property NSNumber *fraction;
+@property NSColor *fillColor;
+@end
+
+@implementation BBDriveProgress
+- (void)drawRect:(NSRect)dirtyRect {
+    NSRect track=self.bounds;
+    [NSColor.separatorColor setFill];
+    NSBezierPath *outline=[NSBezierPath bezierPathWithRoundedRect:track xRadius:2 yRadius:2];
+    [outline fill];
+    BOOL depleted=self.fraction&&self.fraction.doubleValue==0&&[self.fillColor isEqual:NSColor.systemRedColor];
+    if(self.fraction.doubleValue>0||depleted){
+        [NSGraphicsContext saveGraphicsState];
+        [outline addClip];
+        track.size.width=depleted?4:track.size.width*self.fraction.doubleValue;
+        [self.fillColor setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:track xRadius:2 yRadius:2] fill];
+        [NSGraphicsContext restoreGraphicsState];
+    }
+}
+@end
+
+static NSAttributedString *BBDriveMetric(NSString *name, NSString *value, CGFloat size) {
+    NSFont *font=[NSFont systemFontOfSize:size];
+    NSMutableAttributedString *text=[[NSMutableAttributedString alloc]initWithString:[name stringByAppendingString:@": "]
+        attributes:@{NSFontAttributeName:font,NSForegroundColorAttributeName:NSColor.secondaryLabelColor}];
+    [text appendAttributedString:[[NSAttributedString alloc]initWithString:value
+        attributes:@{NSFontAttributeName:[NSFont monospacedDigitSystemFontOfSize:size weight:NSFontWeightRegular],
+                     NSForegroundColorAttributeName:NSColor.labelColor}]];
+    return text;
+}
+
+@implementation BBDriveRow
+- (instancetype)initWithFrame:(NSRect)frame record:(NSDictionary*)drive {
+    if(!(self=[super initWithFrame:frame]))return nil;
+    CGFloat width=frame.size.width;
+    CGFloat metricsWidth=MIN(320,floor(width*0.56));
+    CGFloat metricsX=width-metricsWidth-62;
+    CGFloat titleWidth=MAX(1,metricsX-84);
+    NSImageView *icon=[[NSImageView alloc]initWithFrame:NSMakeRect(16,NSMidY(self.bounds)-20,40,40)];
+    icon.image=[NSImage imageWithSystemSymbolName:@"internaldrive" accessibilityDescription:@"硬盘"];
+    icon.imageAlignment=NSImageAlignCenter;
+    icon.symbolConfiguration=[NSImageSymbolConfiguration configurationWithPointSize:28 weight:NSFontWeightRegular];
+    icon.contentTintColor=NSColor.secondaryLabelColor;
+    [self addSubview:icon];
+
+    NSString *name=drive[@"name"]?:drive[@"id"]?:@"硬盘";
+    NSTextField *title=cardLabel(name,NSMakeRect(72,72,titleWidth,20),[NSFont systemFontOfSize:13 weight:NSFontWeightMedium],NSColor.labelColor);
+    title.toolTip=name;[self addSubview:title];
+    NSString *summary=[drive[@"internal"] boolValue]?@"内置硬盘":@"外置硬盘";
+    NSArray<NSDictionary *> *volumes=drive[@"volumes"];
+    BOOL hasStartupVolume=NO;
+    for(NSDictionary *volume in volumes){
+        if([volume[@"mount"] isEqual:@"/"]){hasStartupVolume=YES;break;}
+    }
+    NSMutableOrderedSet<NSString *> *volumeNames=[NSMutableOrderedSet orderedSet];
+    for(NSDictionary *volume in volumes){
+        NSString *volumeName=volume[@"name"];
+        if(!volumeName.length||[volumeName isEqual:volume[@"id"]])continue;
+        if(hasStartupVolume&&[volume[@"mount"] isEqual:@"/System/Volumes/Data"])continue;
+        [volumeNames addObject:volumeName];
+    }
+    if(volumeNames.count)summary=[summary stringByAppendingFormat:@" ｜ %@",[volumeNames.array componentsJoinedByString:@"、"]];
+    NSTextField *status=cardLabel(summary,NSMakeRect(72,51,titleWidth,17),[NSFont systemFontOfSize:11],NSColor.secondaryLabelColor);
+    status.toolTip=summary;[self addSubview:status];
+    NSString *update=drive[@"captureStatus"];
+    if(!update&&([drive[@"usbSnapshot"] boolValue]||[drive[@"internal"] boolValue])){
+        NSTimeInterval captured=[drive[@"captured_unix"] doubleValue];
+        if(captured>0){
+            NSString *time=[NSDateFormatter localizedStringFromDate:[NSDate dateWithTimeIntervalSince1970:captured] dateStyle:NSDateFormatterNoStyle timeStyle:NSDateFormatterShortStyle];
+            update=[NSString stringWithFormat:@"更新于 %@",time];
+        }
+    }else if([update isEqual:@"插入时已读取"]&&[drive[@"usbSnapshot"] boolValue]){
+        NSDate *captured=[NSDate dateWithTimeIntervalSince1970:[drive[@"captured_unix"] doubleValue]];
+        update=[NSString stringWithFormat:@"插入时读取 · %@",[NSDateFormatter localizedStringFromDate:captured dateStyle:NSDateFormatterNoStyle timeStyle:NSDateFormatterShortStyle]];
+    }
+    if(update.length){
+        NSTextField *updated=cardLabel(update,NSMakeRect(72,34,titleWidth,15),[NSFont systemFontOfSize:10],NSColor.tertiaryLabelColor);
+        updated.toolTip=update;[self addSubview:updated];
+    }
+
+    NSDictionary *health=drive[@"health"];
+    NSString *healthStatus=health[@"status"],*healthText=nil;
+    if([healthStatus isEqual:@"Verified"]||[healthStatus isEqual:@"Passed"])healthText=@"正常";
+    else if([healthStatus isEqual:@"Failing"]||[healthStatus isEqual:@"Failed"])healthText=@"异常";
+
+    NSNumber *temperature=driveNumber(health,@"temperature_c");
+    NSNumber *capacity=driveNumber(drive,@"capacity"),*used=driveNumber(drive,@"used");
+    NSString *capacityText=capacity.unsignedLongLongValue?driveBytes(capacity):@"—";
+    NSString *storage=[NSString stringWithFormat:@"%@ / %@",driveBytes(used)?:@"—",capacityText];
+    NSNumber *usageFraction=used&&capacity.doubleValue>0?@(used.doubleValue/capacity.doubleValue):nil;
+
+    NSDictionary *raw=health[@"raw"];
+    NSNumber *life=driveNumber(raw,@"SSD_Life_Left"),*wear=driveNumber(health,@"percentage_used");
+    if(!life&&wear)life=@(MAX(0,100-wear.doubleValue));
+    NSString *lifeText=life?[NSString stringWithFormat:@"%.0f%%",life.doubleValue]:@"—";
+    NSColor *usageColor=NSColor.controlAccentColor;
+    if(usageFraction.doubleValue>=0.90)usageColor=NSColor.systemRedColor;
+    else if(usageFraction.doubleValue>=0.80)usageColor=NSColor.systemYellowColor;
+    NSColor *lifeColor=NSColor.controlAccentColor;
+    if(life&&life.doubleValue<=10)lifeColor=NSColor.systemRedColor;
+    else if(life&&life.doubleValue<=20)lifeColor=NSColor.systemYellowColor;
+    [self addProgress:@"已用/总计" value:storage fraction:usageFraction color:usageColor frame:NSMakeRect(metricsX,99,metricsWidth,20)];
+    [self addProgress:@"剩余寿命" value:lifeText fraction:life?@(life.doubleValue/100):nil color:lifeColor frame:NSMakeRect(metricsX,76,metricsWidth,20)];
+
+    NSNumber *read=driveNumber(raw,@"Lifetime_Reads_GiB"),*written=driveNumber(raw,@"Lifetime_Writes_GiB");
+    const double bytesPerGiB=1073741824.0;
+    NSString *readText=driveBytes(read?@(read.doubleValue*bytesPerGiB):driveNumber(health,@"bytes_read"));
+    NSString *writtenText=driveBytes(written?@(written.doubleValue*bytesPerGiB):driveNumber(health,@"bytes_written"));
+    NSString *transfer=[NSString stringWithFormat:@"%@ / %@",writtenText?:@"—",readText?:@"—"];
+
+    CGFloat columnGap=16;
+    CGFloat columnWidth=(metricsWidth-columnGap)/2;
+    CGFloat rightColumn=metricsX+columnWidth+columnGap;
+    [self addMetric:BBDriveMetric(@"总写入/总读取",transfer,11) frame:NSMakeRect(metricsX,45,metricsWidth,16)];
+    if(temperature)
+        [self addMetric:BBDriveMetric(@"温度",[NSString stringWithFormat:@"%.0f °C",temperature.doubleValue],10)
+                   frame:NSMakeRect(metricsX,26,columnWidth,14)];
+    if(healthText)
+        [self addMetric:BBDriveMetric(@"SMART",healthText,10) frame:NSMakeRect(rightColumn,26,columnWidth,14)];
+
+    NSNumber *hours=driveNumber(health,@"power_on_hours"),*cycles=driveNumber(health,@"power_cycles");
+    if(hours)
+        [self addMetric:BBDriveMetric(@"通电时长",[NSString stringWithFormat:@"%@ 小时",hours],10)
+                   frame:NSMakeRect(metricsX,7,columnWidth,14)];
+    if(cycles)
+        [self addMetric:BBDriveMetric(@"通电次数",[NSString stringWithFormat:@"%@ 次",cycles],10)
+                   frame:NSMakeRect(rightColumn,7,columnWidth,14)];
+    NSNumber *ejectID=driveNumber(drive,@"ejectID");
+    if(![drive[@"internal"] boolValue]&&ejectID){
+        NSString *action=[drive[@"ejecting"] boolValue]?@"正在弹出…":@"弹出硬盘";
+        NSButton *eject=[NSButton buttonWithTitle:@"弹出" target:self action:@selector(eject:)];
+        eject.frame=NSMakeRect(width-54,NSMidY(self.bounds)-14,42,28);
+        eject.font=[NSFont systemFontOfSize:11];
+        eject.accessibilityLabel=action;
+        eject.bezelStyle=NSBezelStyleRounded;
+        eject.enabled=![drive[@"ejectDisabled"] boolValue];
+        self.ejectID=ejectID;
+        eject.accessibilityIdentifier=@"DriveEject";
+        eject.toolTip=action;
+        [self addSubview:eject];
+    }
+    return self;
+}
+- (void)addMetric:(NSAttributedString *)text frame:(NSRect)frame {
+    NSTextField *label=cardLabel(@"",frame,[NSFont systemFontOfSize:11],NSColor.secondaryLabelColor);
+    label.attributedStringValue=text;
+    label.toolTip=text.string;
+    [self addSubview:label];
+}
+- (void)addProgress:(NSString *)name value:(NSString *)value fraction:(NSNumber *)fraction color:(NSColor *)color frame:(NSRect)frame {
+    NSFont *font=[NSFont systemFontOfSize:11];
+    NSFont *valueFont=[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightMedium];
+    CGFloat nameWidth=ceil([name sizeWithAttributes:@{NSFontAttributeName:font}].width)+4;
+    NSTextField *title=cardLabel(name,NSMakeRect(frame.origin.x,frame.origin.y+6,nameWidth,15),font,NSColor.secondaryLabelColor);
+    [self addSubview:title];
+    NSTextField *amount=cardLabel(value,NSMakeRect(frame.origin.x+nameWidth+6,frame.origin.y+6,frame.size.width-nameWidth-6,15),valueFont,NSColor.labelColor);
+    amount.alignment=NSTextAlignmentRight;
+    amount.toolTip=value;
+    [self addSubview:amount];
+
+    BBDriveProgress *progress=[[BBDriveProgress alloc]initWithFrame:NSMakeRect(frame.origin.x,frame.origin.y,frame.size.width,4)];
+    progress.fillColor=color;
+    if(fraction)progress.fraction=@(MIN(1,MAX(0,fraction.doubleValue)));
+    [self addSubview:progress];
+}
+- (void)eject:(NSButton *)sender {
+    if(sender.enabled&&self.ejectAction)self.ejectAction(self.ejectID);
+}
+- (void)drawRect:(NSRect)dirty {
+    if(_showsSeparator)BBDrawDeviceSeparator(self.bounds.size.width,0);
+}
+@end
+
 @implementation BBDeviceRow
 - (instancetype)initWithFrame:(NSRect)frame record:(NSDictionary*)r {
     if((self=[super initWithFrame:frame])){
@@ -773,6 +966,7 @@ static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*colo
 @property BBEngine*engine;
 @property DBNativeAudioSetup*nativeAudio;
 @property BBDisplayController*displays;
+@property DBUSBSmart*usbSmart;
 @property NSWindow*window;
 @property NSScrollView*devicesScroll;
 @property BBFlippedView*devicesView;
@@ -782,6 +976,9 @@ static NSTextField*cardLabel(NSString*text,NSRect frame,NSFont*font,NSColor*colo
 @property NSTextField*displayHeading;
 @property NSTextField*wirelessHeading;
 @property NSTextField*generalHeading;
+@property BBFlippedView*smartGroup;
+@property NSTextField*smartHeading;
+@property NSTimeInterval disksRefreshedAt;
 @property NSButton*authorizeButton;
 @property NSString*devicesSignature;
 @property NSTextField*heading;
@@ -887,7 +1084,14 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(reopenNotification:) name:@"local.batterybridge.showSettings" object:BundleID];
     [self createStatusItem];
     self.engine=[BBEngine new];self.thread=[[NSThread alloc]initWithTarget:_engine selector:@selector(run) object:nil];self.thread.name=@"DeviceBridge HID";[_thread start];
-    if(!BBTestingUI){self.displays=[BBDisplayController new];[_displays start];}
+    if(!BBTestingUI){
+        self.displays=[BBDisplayController new];[_displays start];
+        self.usbSmart=[DBUSBSmart new];
+        __weak BBApp *weak=self;
+        _usbSmart.changed=^{[weak refresh];};
+        _usbSmart.enabled=YES;
+        [_usbSmart refreshInventory];
+    }
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(wake:) name:NSWorkspaceDidWakeNotification object:nil];
     if(!BBTestingUI&&[BBPreferences() boolForKey:@"AutoStartEnabled"]&&SMAppService.mainAppService.status==SMAppServiceStatusNotRegistered){NSError*e=nil;[SMAppService.mainAppService registerAndReturnError:&e];}
     self.timer=[NSTimer scheduledTimerWithTimeInterval:2 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
@@ -896,6 +1100,7 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
         self.displays.volumeBridgesChanged=^(NSArray *rows,BOOL userInitiated){[weak.nativeAudio updateDisplayBridges:rows userInitiated:userInitiated];};
         [self.nativeAudio updateDisplayBridges:self.displays.snapshot userInitiated:NO];
         dispatch_async(dispatch_get_main_queue(),^{
+            [self offerUSBSmartSetup];
             [self.displays beginMediaKeyOnboarding];[self.nativeAudio beginOnboarding];
         });}
 }
@@ -911,6 +1116,8 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
 - (void)menuNeedsUpdate:(NSMenu*)menu {
     if(menu!=_statusMenu)return;[menu removeAllItems];
     [menu addItem:[self menuItem:@"显示主界面" action:@selector(showSettings:) value:nil]];
+    if(_usbSmart.available&&!_usbSmart.serviceReady&&!_usbSmart.busy)
+        [menu addItem:[self menuItem:@"授权外置硬盘 SMART…" action:@selector(enableUSBSmart) value:nil]];
     NSMenuItem*quit=[self menuItem:@"退出程序" action:@selector(quit:) value:nil];quit.keyEquivalent=@"q";[menu addItem:quit];
 }
 - (void)toggleMapping:(NSMenuItem*)sender {
@@ -962,13 +1169,14 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
 }
 - (void)showSettings:(id)sender {[self showWindow];}
 - (void)quit:(id)sender {
+    if(_usbSmart.busy){[self showWindow];return;}
     if(BBTestingUI||!_displays){[NSApp terminate:sender];return;}
     [self prepareToQuit];
 }
 - (void)reopenNotification:(NSNotification*)n {[self showWindow];}
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {return NO;}
 
-- (void)wake:(NSNotification*)n {[_engine kick];}
+- (void)wake:(NSNotification*)n {[_engine kick];[_usbSmart refreshInventory];}
 - (BOOL)applicationShouldHandleReopen:(NSApplication*)sender hasVisibleWindows:(BOOL)visible {[self showWindow];return YES;}
 - (void)buildWindow {
     if(_window)return;
@@ -992,6 +1200,12 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     for(NSNumber *n in @[@300,@1800,@3600,@7200,@10800]){[_intervalPicker addItemWithTitle:[@"每" stringByAppendingString:BBIntervalLabel(n.doubleValue)]];_intervalPicker.lastItem.representedObject=n;}[_settingsGroup addSubview:_intervalPicker];
     [_settingsGroup addSubview:cardLabel(@"登录时启动",NSMakeRect(16,75,220,20),[NSFont systemFontOfSize:13],NSColor.labelColor)];
     self.autoStartSwitch=[[NSSwitch alloc]initWithFrame:NSMakeRect(612,73,44,24)];_autoStartSwitch.target=self;_autoStartSwitch.action=@selector(toggleAutoStart:);_autoStartSwitch.controlSize=NSControlSizeSmall;_autoStartSwitch.accessibilityLabel=@"登录时启动";_autoStartSwitch.autoresizingMask=NSViewMinXMargin;[_settingsGroup addSubview:_autoStartSwitch];
+    if(_usbSmart.available){
+        self.smartHeading=cardLabel(@"硬盘",NSZeroRect,[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSColor.labelColor);
+        [_devicesView addSubview:_smartHeading];
+        self.smartGroup=[[BBFlippedView alloc]initWithFrame:NSZeroRect];
+        [_devicesView addSubview:_smartGroup];
+    }
     if(!BBTestingUI){[_window setFrameAutosaveName:@"DeviceListWindow"];[_window setFrameUsingName:@"DeviceListWindow"];}
 }
 - (void)windowWillClose:(NSNotification*)notification {
@@ -1021,7 +1235,10 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
             if (row.isTrackingBrightness || row.isEditingPercent) return;
         }
     }
-    NSString*signature=[NSString stringWithFormat:@"%@:%ld",rows,(long)(NSDate.date.timeIntervalSince1970/120)];if([signature isEqual:_devicesSignature])return;_devicesSignature=signature;
+    NSTimeInterval now=NSDate.date.timeIntervalSince1970;
+    if(now-_disksRefreshedAt>=interval){_disksRefreshedAt=now;[_usbSmart refreshInventory];}
+    NSArray *driveRows=_usbSmart.drives?:@[];
+    NSString*signature=[NSString stringWithFormat:@"%@:%@:%ld",rows,driveRows,(long)(now/120)];if([signature isEqual:_devicesSignature])return;_devicesSignature=signature;
     NSPoint origin=_devicesScroll.contentView.bounds.origin;
     _devicesScroll.autohidesScrollers=NO;[_devicesScroll tile];
     CGFloat documentWidth=MAX(1,_devicesScroll.contentSize.width),width=MAX(1,documentWidth-48),y=100;
@@ -1041,6 +1258,23 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
         }
         [group setNeedsDisplay:YES];y+=groupHeight+28;
     }
+    if(_smartGroup){
+        _smartHeading.frame=NSMakeRect(26,y,MAX(1,width-4),20);y+=32;
+        CGFloat height=driveRows.count?driveRows.count*BBDriveRowHeight:64;
+        _smartGroup.frame=NSMakeRect(24,y,width,height);_smartGroup.groupHeight=height;
+        for(NSView *view in _smartGroup.subviews.copy)[view removeFromSuperview];
+        if(!driveRows.count)[_smartGroup addSubview:cardLabel(@"未发现硬盘",NSMakeRect(16,22,MAX(1,width-32),20),[NSFont systemFontOfSize:12],NSColor.secondaryLabelColor)];
+        for(NSUInteger i=0;i<driveRows.count;i++){
+            BBDriveRow *row=[[BBDriveRow alloc]initWithFrame:NSMakeRect(0,i*BBDriveRowHeight,width,BBDriveRowHeight) record:driveRows[i]];
+            row.showsSeparator=i+1<driveRows.count;
+            __weak BBApp *weak=self;
+            row.ejectAction=^(NSNumber *mediaID){
+                [weak.usbSmart ejectDrive:mediaID completion:^(NSError *error){if(error)[weak showError:error];}];
+            };
+            [_smartGroup addSubview:row];
+        }
+        [_smartGroup setNeedsDisplay:YES];y+=height+28;
+    }
     _generalHeading.frame=NSMakeRect(26,y,MAX(1,width-4),20);y+=32;
     _settingsGroup.frame=NSMakeRect(24,y,width,116);y+=140;
     _devicesView.frame=NSMakeRect(0,0,documentWidth,MAX(y,_devicesScroll.contentSize.height));
@@ -1048,15 +1282,31 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     [_devicesScroll.contentView scrollToPoint:origin];[_devicesScroll reflectScrolledClipView:_devicesScroll.contentView];
 }
 
+- (void)enableUSBSmart {
+    __weak BBApp *weak=self;
+    [_usbSmart prepareService:^(BOOL ready){[weak refresh];}];
+}
+- (void)offerUSBSmartSetup {
+    if(!_usbSmart.available||_usbSmart.serviceReady||[BBPreferences() boolForKey:@"USBSmartSetupOffered"])return;
+    [BBPreferences() setBool:YES forKey:@"USBSmartSetupOffered"];
+    NSAlert *alert=[NSAlert new];
+    alert.messageText=@"启用外置硬盘 SMART";
+    alert.informativeText=@"安装后台读取组件需要一次管理员授权。之后插入兼容的 SSK 硬盘盒，可在首次挂载前自动采集 SMART。也可稍后从菜单栏授权。";
+    [alert addButtonWithTitle:@"启用…"];
+    [alert addButtonWithTitle:@"稍后"];
+    [NSApp activateIgnoringOtherApps:YES];
+    if([alert runModal]==NSAlertFirstButtonReturn)[self enableUSBSmart];
+}
 - (void)permission:(id)sender {
     // Request only when the user invokes the authorization action.
     // The OS owns the consent decision; opening Settings does not imply a grant.
     if(!BBTestingUI&&IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)){[_engine kick];[self refresh];return;}
     [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"]];
 }
-- (void)rescan:(id)sender {[_engine kick];[_displays refreshControls];}
+- (void)rescan:(id)sender {[_engine kick];[_displays refreshControls];[_usbSmart refreshInventory];}
 - (void)login:(id)sender {if(!BBTestingUI)[SMAppService openSystemSettingsLoginItems];}
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
+    if(_usbSmart.busy)return NSTerminateCancel;
     if(BBTestingUI||!_displays||_terminationReady)return NSTerminateNow;
     _terminationReplyPending=YES;
     [self prepareToQuit];
@@ -1087,7 +1337,7 @@ static NSButton*button(NSString*title,id target,SEL action,NSRect frame){NSButto
     }];
 }
 - (void)applicationWillTerminate:(NSNotification*)n {
-    [_nativeAudio stop];[_displays stop];_engine.stopping=YES;[_timer invalidate];if(_lockFD>=0)close(_lockFD);
+    self.usbSmart=nil;[_nativeAudio stop];[_displays stop];_engine.stopping=YES;[_timer invalidate];if(_lockFD>=0)close(_lockFD);
 }
 @end
 
