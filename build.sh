@@ -18,7 +18,7 @@ clang -fobjc-arc -fblocks -O2 -Wall -Wextra -Wno-unused-parameter \
   -o "${bundle_dir}/Contents/MacOS/DeviceBridge"
 python3 - "${bundle_dir}/Contents/Info.plist" <<'PY'
 import plistlib,sys
-p={'CFBundleIdentifier':'local.batterybridge.agent','CFBundleName':'DeviceBridge','CFBundleDisplayName':'DeviceBridge','CFBundleExecutable':'DeviceBridge','CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.1.15','CFBundleVersion':'53','LSMinimumSystemVersion':'13.0','LSUIElement':True,'CFBundleIconFile':'AppIcon','NSHighResolutionCapable':True,'NSHumanReadableCopyright':'DeviceBridge · local utility · preview'}
+p={'CFBundleIdentifier':'local.batterybridge.agent','CFBundleName':'DeviceBridge','CFBundleDisplayName':'DeviceBridge','CFBundleExecutable':'DeviceBridge','CFBundlePackageType':'APPL','CFBundleShortVersionString':'1.0.0','CFBundleVersion':'54','LSMinimumSystemVersion':'13.0','LSUIElement':True,'CFBundleIconFile':'AppIcon','NSHighResolutionCapable':True,'NSHumanReadableCopyright':'DeviceBridge'}
 with open(sys.argv[1],'wb') as f:plistlib.dump(p,f)
 PY
 icon_work="${output_dir}/icon-work"

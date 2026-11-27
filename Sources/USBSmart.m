@@ -219,6 +219,22 @@ static DADissenterRef DBApproveMount(DADiskRef disk, void *context) {
     return [(__bridge DBUSBSmart *)context approveMount:disk];
 }
 
+static NSIndexSet *DBEjectedDriveRows(NSArray<NSDictionary *> *rows,
+    NSMutableDictionary<NSNumber *, NSNumber *> *ejectedMedia) {
+    // macOS can continue listing a physical USB disk with all its volumes unmounted.
+    return [rows indexesOfObjectsPassingTest:^BOOL(NSDictionary *row, NSUInteger index, BOOL *stop) {
+        NSNumber *media = row[@"ejectID"], *bridge = row[@"registry"];
+        if (!media) return NO;
+        NSArray *matches = bridge ? [ejectedMedia allKeysForObject:bridge] : @[];
+        if (!ejectedMedia[media] && !matches.count) return NO;
+        if (![row[@"volumes"] count]) return YES;
+        // If a volume is mounted again, show the disk and allow another eject.
+        [ejectedMedia removeObjectForKey:media];
+        [ejectedMedia removeObjectsForKeys:matches];
+        return NO;
+    }];
+}
+
 @implementation DBUSBSmart {
     DASessionRef _session;
     NSString *_helper;
@@ -230,6 +246,7 @@ static DADissenterRef DBApproveMount(DADiskRef disk, void *context) {
     NSUInteger _inventoryGeneration;
     NSArray<NSDictionary *> *_builtInAndExternalDrives;
     NSMutableDictionary<NSNumber *, NSDictionary *> *_snapshotsByRegistry;
+    NSMutableDictionary<NSNumber *, NSNumber *> *_ejectedMedia;
     NSNumber *_statusRegistry;
     NSNumber *_ejectingID;
 }
@@ -243,6 +260,7 @@ static DADissenterRef DBApproveMount(DADiskRef disk, void *context) {
     _seen = [NSMutableDictionary new];
     _builtInAndExternalDrives = @[];
     _snapshotsByRegistry = [NSMutableDictionary new];
+    _ejectedMedia = [NSMutableDictionary new];
     _serviceReady = DBSmartServiceReady();
     if ([NSFileManager.defaultManager isExecutableFileAtPath:_helper]) {
         _session = DASessionCreate(kCFAllocatorDefault);
@@ -279,7 +297,7 @@ static DADissenterRef DBApproveMount(DADiskRef disk, void *context) {
     io_service_t media = IOServiceGetMatchingService(kIOMainPortDefault, IORegistryEntryIDMatching(mediaID.unsignedLongLongValue));
     DADiskRef disk = media && IOObjectConformsTo(media, kIOMediaClass)
         ? DADiskCreateFromIOMedia(kCFAllocatorDefault, _session, media) : NULL;
-    if (media) IOObjectRelease(media);
+    NSNumber *bridge = media ? DBBridgeForMedia(media).registry : nil;
     NSDictionary *description = disk ? CFBridgingRelease(DADiskCopyDescription(disk)) : nil;
     const char *name = disk ? DADiskGetBSDName(disk) : NULL;
     NSString *bsdName = name ? [NSString stringWithUTF8String:name] : nil;
@@ -300,6 +318,7 @@ static DADissenterRef DBApproveMount(DADiskRef disk, void *context) {
             self->_ejectingID = nil;
             if (!error) {
                 self->_inventoryGeneration++;
+                self->_ejectedMedia[mediaID] = bridge ?: mediaID;
                 NSArray *drives = self->_builtInAndExternalDrives;
                 self->_builtInAndExternalDrives = [drives filteredArrayUsingPredicate:
                     [NSPredicate predicateWithBlock:^BOOL(NSDictionary *drive, NSDictionary *bindings) {
@@ -372,6 +391,16 @@ static DADissenterRef DBApproveMount(DADiskRef disk, void *context) {
             }
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (drives && generation == self->_inventoryGeneration) {
+                    if (self->_ejectedMedia.count) {
+                        [rows removeObjectsAtIndexes:DBEjectedDriveRows(rows, self->_ejectedMedia)];
+                        for (NSNumber *mediaID in self->_ejectedMedia.allKeys) {
+                            NSNumber *identity = self->_ejectedMedia[mediaID];
+                            io_service_t node = IOServiceGetMatchingService(kIOMainPortDefault,
+                                IORegistryEntryIDMatching(identity.unsignedLongLongValue));
+                            if (node) IOObjectRelease(node);
+                            else [self->_ejectedMedia removeObjectForKey:mediaID];
+                        }
+                    }
                     self->_builtInAndExternalDrives = rows;
                     if (!self.busy) {
                         NSSet *connected = [NSSet setWithArray:DBConnectedBridges().allValues];

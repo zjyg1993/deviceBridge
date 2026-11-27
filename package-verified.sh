@@ -10,8 +10,12 @@ output_dir="${output_dir:A}"
 codesign --verify --strict --verbose=2 "${bundle_dir}"
 version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${bundle_dir}/Contents/Info.plist")
 runtime_version=$("${bundle_dir}/Contents/MacOS/DeviceBridge" --version)
-[[ "${runtime_version}" == "${version}-preview" ]] || { print -u2 'Bundle and executable versions differ'; exit 1; }
-image_path="${output_dir}/DeviceBridge-${version}-preview.dmg"
+case "${runtime_version}" in
+    "${version}") volume_name="DeviceBridge ${version}" ;;
+    "${version}-preview") volume_name="DeviceBridge ${version} Preview" ;;
+    *) print -u2 'Bundle and executable versions differ'; exit 1 ;;
+esac
+image_path="${output_dir}/DeviceBridge-${runtime_version}.dmg"
 [[ ! -e "${image_path}" ]] || { print -u2 'Release already exists'; exit 1; }
 release_dir=$(mktemp -d "${project_dir}/release.noindex/package.XXXXXX")
 trap 'rm -rf "${release_dir}"' EXIT
@@ -37,7 +41,7 @@ expected = {'DeviceBridge.app', 'Applications', 'README.md'}
 if {p.name for p in volume.iterdir()} != expected:
     raise SystemExit('Unexpected disk image contents')
 PYREADME
-hdiutil create -srcfolder "${volume_dir}" -fs HFS+ -volname "DeviceBridge ${version} Preview" -format UDZO "${release_dir}/DeviceBridge.dmg"
+hdiutil create -srcfolder "${volume_dir}" -fs HFS+ -volname "${volume_name}" -format UDZO "${release_dir}/DeviceBridge.dmg"
 hdiutil verify "${release_dir}/DeviceBridge.dmg"
 mv "${release_dir}/DeviceBridge.dmg" "${image_path}"
 if [[ "${bundle_dir}" == "${project_dir}/build.noindex/DeviceBridge.app" ]]; then rm -rf "${bundle_dir}"; fi
